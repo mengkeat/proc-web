@@ -2,9 +2,10 @@ import { spawn } from "bun";
 
 // --- CLI argument parsing ---
 
-function parseArgs(argv: string[]): { port: number; maxHistory: number; logDir: string | null; command: string[] } {
+function parseArgs(argv: string[]): { port: number; host: string; maxHistory: number; logDir: string | null; command: string[] } {
   const args = argv.slice(2);
   let port = 3000;
+  let host = "127.0.0.1";
   let maxHistory = 10000; // max chunks to keep in memory
   let logDir: string | null = null;
   const command: string[] = [];
@@ -24,6 +25,12 @@ function parseArgs(argv: string[]): { port: number; maxHistory: number; logDir: 
         process.exit(1);
       }
       maxHistory = val;
+    } else if (args[i] === "--host") {
+      host = args[++i];
+      if (!host) {
+        console.error("Missing host value");
+        process.exit(1);
+      }
     } else if (args[i] === "--log-dir") {
       logDir = args[++i];
       if (!logDir) {
@@ -36,15 +43,15 @@ function parseArgs(argv: string[]): { port: number; maxHistory: number; logDir: 
   }
 
   if (command.length === 0) {
-    console.error("Usage: bun run server.ts [--port N] [--max-history N] [--log-dir DIR] <command> [args...]");
+    console.error("Usage: bun run server.ts [--port N] [--host ADDR] [--max-history N] [--log-dir DIR] <command> [args...]");
     console.error("Example: bun run server.ts ls -la");
     process.exit(1);
   }
 
-  return { port, maxHistory, logDir, command };
+  return { port, host, maxHistory, logDir, command };
 }
 
-const { port: PORT, maxHistory: MAX_HISTORY, logDir: LOG_DIR, command } = parseArgs(Bun.argv);
+const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, command } = parseArgs(Bun.argv);
 
 // --- Disk-backed log persistence ---
 
@@ -259,7 +266,7 @@ const exitMessage = () => `\r\n[Process exited with code ${processExitCode}]\r\n
 
 const server = Bun.serve({
   port: PORT,
-  hostname: "0.0.0.0",
+  hostname: HOST,
   idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url);

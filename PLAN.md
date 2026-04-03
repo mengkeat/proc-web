@@ -148,12 +148,12 @@ Before making remote access richer, lock down control surfaces.
 **Why:** Binding to `0.0.0.0` by default exposes output and process controls on the network.
 
 **Tasks**
-- Bind to `127.0.0.1` by default
-- Add explicit `--host 0.0.0.0` for remote access
-- Update README usage examples
+- [x] Bind to `127.0.0.1` by default
+- [x] Add explicit `--host 0.0.0.0` for remote access
+- [x] Update README usage examples
 
 **Done when**
-- Local usage is safe by default
+- [x] Local usage is safe by default
 
 ### 2.2 Add lightweight authentication / access tokens
 **Priority:** High  
