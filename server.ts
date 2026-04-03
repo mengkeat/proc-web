@@ -157,9 +157,9 @@ function startHeartbeat() {
   if (heartbeatTimer) return;
   heartbeatTimer = setInterval(() => {
     const ping = textEncoder.encode(": ping\n\n");
-    for (const client of stdoutClients) { try { client.enqueue(ping); } catch { stdoutClients.delete(client); } }
-    for (const client of stderrClients) { try { client.enqueue(ping); } catch { stderrClients.delete(client); } }
-    for (const client of combinedClients) { try { client.enqueue(ping); } catch { combinedClients.delete(client); } }
+    for (const client of stdoutClients) { try { client.enqueue(ping); } catch { dropClient(client, stdoutClients); } }
+    for (const client of stderrClients) { try { client.enqueue(ping); } catch { dropClient(client, stderrClients); } }
+    for (const client of combinedClients) { try { client.enqueue(ping); } catch { dropClient(client, combinedClients); } }
   }, HEARTBEAT_INTERVAL_MS);
 }
 
@@ -183,11 +183,24 @@ function sendToClient(client: ReadableStreamDefaultController, data: string, eve
   try { client.enqueue(encodeSSE(data, eventType, id)); } catch { /* client disconnected */ }
 }
 
+function dropClient(client: ReadableStreamDefaultController, clients: Set<ReadableStreamDefaultController>) {
+  if (clients.delete(client)) {
+    activeConnectionCount--;
+    try { client.close(); } catch { /* already closed */ }
+    if (activeConnectionCount === 0) stopHeartbeat();
+    shutdownIfIdle();
+  }
+}
+
 function broadcastToClients(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string, id?: number) {
   if (!clients.size) return;
   const encoded = encodeSSE(data, eventType, id);
   for (const client of clients) {
-    try { client.enqueue(encoded); } catch { clients.delete(client); }
+    try {
+      client.enqueue(encoded);
+    } catch {
+      dropClient(client, clients);
+    }
   }
 }
 

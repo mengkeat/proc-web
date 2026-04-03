@@ -116,13 +116,13 @@ These changes protect the app under long-running and high-volume workloads.
 **Why:** Slow or stalled clients should not degrade the whole server.
 
 **Tasks**
-- Detect failed/broken client streams reliably
-- Add cleanup and backpressure-aware handling where possible
-- Drop lagging clients safely
-- Ensure one slow client does not grow server memory unboundedly
+- [x] Detect failed/broken client streams reliably
+- [x] Add cleanup and backpressure-aware handling where possible
+- [x] Drop lagging clients safely
+- [x] Ensure one slow client does not grow server memory unboundedly
 
 **Done when**
-- High-throughput commands remain stable with multiple viewers
+- [x] High-throughput commands remain stable with multiple viewers
 
 ### 1.5 Improve shutdown lifecycle
 **Priority:** High  
