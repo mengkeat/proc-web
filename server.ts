@@ -290,7 +290,9 @@ const server = Bun.serve({
     const { pathname } = url;
 
     if (pathname === "/" || pathname === "/index.html") {
-      return new Response(HTML, { headers: { "Content-Type": "text/html" } });
+      const hasControl = checkAuth(req, url);
+      const html = HTML.replace('__HAS_CONTROL__', String(hasControl));
+      return new Response(html, { headers: { "Content-Type": "text/html" } });
     }
 
     if (pathname === "/status") {
@@ -671,7 +673,14 @@ const HTML = `<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.js"></script>
   <script>
     const AUTH_TOKEN = ${AUTH_TOKEN ? `'${AUTH_TOKEN}'` : 'null'};
+    const HAS_CONTROL = __HAS_CONTROL__;
     function authHeaders() { return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}; }
+
+    // Hide control elements in read-only mode
+    if (!HAS_CONTROL) {
+      document.getElementById('kill-btn').style.display = 'none';
+      document.getElementById('stdin-area').style.display = 'none';
+    }
 
     const TERMINAL_OPTIONS = {
       fontSize: 14,

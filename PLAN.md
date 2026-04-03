@@ -172,12 +172,12 @@ Before making remote access richer, lock down control surfaces.
 **Why:** Multi-client support becomes much more useful with permission separation.
 
 **Tasks**
-- Define read-only and control capabilities
-- Hide/disable kill and stdin in read-only mode
-- Document sharing model
+- [x] Define read-only and control capabilities
+- [x] Hide/disable kill and stdin in read-only mode
+- [x] Document sharing model
 
 **Done when**
-- Sessions can be shared safely without giving everyone control
+- [x] Sessions can be shared safely without giving everyone control
 
 ---
 
