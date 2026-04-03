@@ -255,11 +255,12 @@ let spawnError: string | null = null;
 let proc: ReturnType<typeof spawn> | null = null;
 let ptyProc: any = null;
 
-function writeStdin(text: string) {
+function writeStdin(text: string, raw = false) {
+  const data = raw ? text : text + "\n";
   if (PTY_MODE && ptyProc) {
-    ptyProc.write(text + "\n");
+    ptyProc.write(data);
   } else if (proc) {
-    try { proc.stdin.write(text + "\n"); proc.stdin.flush(); } catch { /* closed */ }
+    try { proc.stdin.write(data); proc.stdin.flush(); } catch { /* closed */ }
   }
 }
 
@@ -346,7 +347,25 @@ const server = Bun.serve({
       if (!checkAuth(req, url)) return UNAUTHORIZED();
       if (!processExited) {
         const text = await req.text();
-        writeStdin(text);
+        const raw = url.searchParams.get("raw") === "1";
+        writeStdin(text, raw);
+      }
+      return Response.json({ ok: true });
+    }
+
+    if (pathname === "/signal" && req.method === "POST") {
+      if (!checkAuth(req, url)) return UNAUTHORIZED();
+      if (!processExited) {
+        const { signal } = await req.json();
+        const sigMap: Record<string, number> = { SIGINT: 2, SIGTERM: 15, SIGKILL: 9 };
+        const sigNum = sigMap[signal];
+        if (sigNum !== undefined) {
+          if (PTY_MODE && ptyProc) {
+            try { ptyProc.kill(sigNum); } catch { /* ignore */ }
+          } else if (proc) {
+            try { proc.kill(sigNum); } catch { /* ignore */ }
+          }
+        }
       }
       return Response.json({ ok: true });
     }
@@ -717,6 +736,11 @@ const HTML = `<!DOCTYPE html>
     <span class="stdin-label">stdin:</span>
     <input type="text" id="stdin-input" placeholder="Type input and press Enter…" autocomplete="off" spellcheck="false" />
     <button class="btn" onclick="sendStdin()">Send</button>
+    <button class="btn" onclick="sendSignalChar('\\x03')" title="Ctrl+C">Ctrl+C</button>
+    <button class="btn" onclick="sendSignalChar('\\x04')" title="Ctrl+D">Ctrl+D</button>
+    <button class="btn" onclick="sendSignal('SIGINT')" title="Send SIGINT">INT</button>
+    <button class="btn" onclick="sendSignal('SIGTERM')" title="Send SIGTERM">TERM</button>
+    <button class="btn btn-danger" onclick="sendSignal('SIGKILL')" title="Send SIGKILL">KILL</button>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
@@ -838,6 +862,12 @@ const HTML = `<!DOCTYPE html>
       if (!text) return;
       fetch('/stdin', { method: 'POST', body: text, headers: authHeaders() }).catch(() => {});
       inp.value = '';
+    }
+    function sendSignalChar(ch) {
+      fetch('/stdin?raw=1', { method: 'POST', body: ch, headers: authHeaders() }).catch(() => {});
+    }
+    function sendSignal(sig) {
+      fetch('/signal', { method: 'POST', body: JSON.stringify({ signal: sig }), headers: { 'Content-Type': 'application/json', ...authHeaders() } }).catch(() => {});
     }
     document.getElementById('stdin-input').addEventListener('keydown', e => {
       if (e.key === 'Enter') sendStdin();

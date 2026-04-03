@@ -214,13 +214,13 @@ This phase closes the gap between “log viewer” and “real browser terminal�
 **Why:** Current stdin always appends newline and control options are minimal.
 
 **Tasks**
-- Add “send raw” vs “send line”
-- Add Ctrl+C / Ctrl+D helpers
-- Add signal actions: SIGINT, SIGTERM, SIGKILL
-- Add restart / rerun support
+- [x] Add “send raw” vs “send line”
+- [x] Add Ctrl+C / Ctrl+D helpers
+- [x] Add signal actions: SIGINT, SIGTERM, SIGKILL
+- [x] Add restart / rerun support
 
 **Done when**
-- Interactive and long-running processes can be controlled cleanly from the UI
+- [x] Interactive and long-running processes can be controlled cleanly from the UI
 
 ---
 
