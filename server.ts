@@ -781,6 +781,8 @@ const HTML = `<!DOCTYPE html>
       combined: createPanel('combined-terminal'),
     };
 
+    let currentTab = 'stdout';
+
     function sendResize() {
       const term = panels[currentTab].terminal;
       fetch('/resize', {
@@ -795,17 +797,16 @@ const HTML = `<!DOCTYPE html>
     }
     fitActivePanel();
     window.addEventListener('resize', fitActivePanel);
-
-    // --- Tab switching ---
-    let currentTab = 'stdout';
     function switchTab(name) {
       currentTab = name;
       document.querySelectorAll('.tab').forEach(t =>
         t.classList.toggle('active', t.dataset.tab === name));
       document.querySelectorAll('.panel').forEach(p =>
         p.classList.toggle('active', p.id === 'panel-' + name));
-      try { panels[name].fitAddon.fit(); } catch (_) {}
-      if (autoScroll) panels[name].terminal.scrollToBottom();
+      requestAnimationFrame(() => {
+        try { panels[name].fitAddon.fit(); } catch (_) {}
+        if (autoScroll) panels[name].terminal.scrollToBottom();
+      });
     }
 
     // --- Auto-scroll ---
