@@ -190,12 +190,12 @@ This phase closes the gap between “log viewer” and “real browser terminal�
 **Why:** Many interactive programs need a TTY to behave correctly.
 
 **Tasks**
-- Add optional PTY-backed child execution mode
-- Preserve current pipe mode for simple non-interactive commands
-- Decide CLI/API for selecting mode
+- [x] Add optional PTY-backed child execution mode
+- [x] Preserve current pipe mode for simple non-interactive commands
+- [x] Decide CLI/API for selecting mode
 
 **Done when**
-- Interactive programs behave like they do in a real terminal
+- [x] Interactive programs behave like they do in a real terminal
 
 ### 3.2 Support terminal resize propagation
 **Priority:** High  

@@ -2,13 +2,14 @@ import { spawn } from "bun";
 
 // --- CLI argument parsing ---
 
-function parseArgs(argv: string[]): { port: number; host: string; maxHistory: number; logDir: string | null; token: string | null; command: string[] } {
+function parseArgs(argv: string[]): { port: number; host: string; maxHistory: number; logDir: string | null; token: string | null; pty: boolean; command: string[] } {
   const args = argv.slice(2);
   let port = 3000;
   let host = "127.0.0.1";
   let maxHistory = 10000; // max chunks to keep in memory
   let logDir: string | null = null;
   let token: string | null = null;
+  let pty = false;
   const command: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -44,21 +45,23 @@ function parseArgs(argv: string[]): { port: number; host: string; maxHistory: nu
         console.error("Missing token value");
         process.exit(1);
       }
+    } else if (args[i] === "--pty") {
+      pty = true;
     } else {
       command.push(args[i]);
     }
   }
 
   if (command.length === 0) {
-    console.error("Usage: bun run server.ts [--port N] [--host ADDR] [--token TOKEN] [--max-history N] [--log-dir DIR] <command> [args...]");
+    console.error("Usage: bun run server.ts [--port N] [--host ADDR] [--token TOKEN] [--pty] [--max-history N] [--log-dir DIR] <command> [args...]");
     console.error("Example: bun run server.ts ls -la");
     process.exit(1);
   }
 
-  return { port, host, maxHistory, logDir, token, command };
+  return { port, host, maxHistory, logDir, token, pty, command };
 }
 
-const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, token: AUTH_TOKEN, command } = parseArgs(Bun.argv);
+const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, token: AUTH_TOKEN, pty: PTY_MODE, command } = parseArgs(Bun.argv);
 
 // --- Disk-backed log persistence ---
 
@@ -249,16 +252,50 @@ const SSE_HEADERS = {
 // --- Spawn the child process ---
 
 let spawnError: string | null = null;
-let proc: ReturnType<typeof spawn>;
+let proc: ReturnType<typeof spawn> | null = null;
+let ptyProc: any = null;
 
-try {
-  proc = spawn({ cmd: command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
-} catch (err) {
-  spawnError = err instanceof Error ? err.message : String(err);
-  console.error(`Failed to spawn process: ${spawnError}`);
-  processExited = true;
-  processExitCode = 127;
-  proc = null as any;
+function writeStdin(text: string) {
+  if (PTY_MODE && ptyProc) {
+    ptyProc.write(text + "\n");
+  } else if (proc) {
+    try { proc.stdin.write(text + "\n"); proc.stdin.flush(); } catch { /* closed */ }
+  }
+}
+
+function killChild() {
+  if (PTY_MODE && ptyProc) {
+    ptyProc.kill();
+  } else if (proc) {
+    proc.kill();
+  }
+}
+
+if (PTY_MODE) {
+  try {
+    const nodePty = require("node-pty");
+    ptyProc = nodePty.spawn(command[0], command.slice(1), {
+      name: "xterm-256color",
+      cols: 80,
+      rows: 24,
+      cwd: process.cwd(),
+      env: process.env,
+    });
+  } catch (err) {
+    spawnError = err instanceof Error ? err.message : String(err);
+    console.error(`Failed to spawn PTY process: ${spawnError}`);
+    processExited = true;
+    processExitCode = 127;
+  }
+} else {
+  try {
+    proc = spawn({ cmd: command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+  } catch (err) {
+    spawnError = err instanceof Error ? err.message : String(err);
+    console.error(`Failed to spawn process: ${spawnError}`);
+    processExited = true;
+    processExitCode = 127;
+  }
 }
 
 // --- HTTP server ---
@@ -301,15 +338,15 @@ const server = Bun.serve({
 
     if (pathname === "/kill" && req.method === "POST") {
       if (!checkAuth(req, url)) return UNAUTHORIZED();
-      if (proc && !processExited) proc.kill();
+      if (!processExited) killChild();
       return Response.json({ ok: true });
     }
 
     if (pathname === "/stdin" && req.method === "POST") {
       if (!checkAuth(req, url)) return UNAUTHORIZED();
-      if (proc && !processExited) {
+      if (!processExited) {
         const text = await req.text();
-        try { proc.stdin.write(text + "\n"); await proc.stdin.flush(); } catch { /* closed */ }
+        writeStdin(text);
       }
       return Response.json({ ok: true });
     }
@@ -350,32 +387,63 @@ const server = Bun.serve({
 
 // --- Pipe process output to SSE clients ---
 
-const stdoutDecoder = new TextDecoder();
-const stderrDecoder = new TextDecoder();
+function handleStdoutData(data: string) {
+  stdoutHistory.push(data);
+  stdoutDropped = trimHistory(stdoutHistory, stdoutDropped);
+  const stdoutEventId = stdoutDropped + stdoutHistory.length - 1;
+  broadcastToClients(stdoutClients, data, undefined, stdoutEventId);
+  combinedHistory.push({ type: "stdout", data });
+  combinedDropped = trimHistory(combinedHistory, combinedDropped);
+  const combinedEventId = combinedDropped + combinedHistory.length - 1;
+  broadcastToClients(combinedClients, data, "stdout", combinedEventId);
+  appendLog(stdoutLogPath, data);
+  appendLog(combinedLogPath, data);
+}
 
-if (!spawnError) {
+function handleStderrData(data: string) {
+  stderrHistory.push(data);
+  stderrDropped = trimHistory(stderrHistory, stderrDropped);
+  const stderrEventId = stderrDropped + stderrHistory.length - 1;
+  broadcastToClients(stderrClients, data, undefined, stderrEventId);
+  combinedHistory.push({ type: "stderr", data });
+  combinedDropped = trimHistory(combinedHistory, combinedDropped);
+  const combinedEventId = combinedDropped + combinedHistory.length - 1;
+  broadcastToClients(combinedClients, data, "stderr", combinedEventId);
+  appendLog(stderrLogPath, data);
+  appendLog(combinedLogPath, data);
+}
+
+function handleProcessExit(code: number) {
+  processExitCode = code;
+  processExited = true;
+  const message = exitMessage();
+  broadcastToClients(stdoutClients, message);
+  broadcastToClients(stderrClients, message);
+  broadcastToClients(combinedClients, message);
+  console.log(`\nProcess exited with code ${code}`);
+  updateMetadata(code);
+  shutdownIfIdle();
+}
+
+if (!spawnError && PTY_MODE && ptyProc) {
+  // PTY mode: single output stream, no separate stderr
+  ptyProc.onData((data: string) => {
+    handleStdoutData(data);
+  });
+  ptyProc.onExit(({ exitCode }: { exitCode: number }) => {
+    handleProcessExit(exitCode);
+  });
+} else if (!spawnError && proc) {
+  const stdoutDecoder = new TextDecoder();
+  const stderrDecoder = new TextDecoder();
+
   proc.stdout.pipeTo(new WritableStream({
     write(chunk) {
-      const data = stdoutDecoder.decode(chunk, { stream: true });
-      stdoutHistory.push(data);
-      stdoutDropped = trimHistory(stdoutHistory, stdoutDropped);
-      const stdoutEventId = stdoutDropped + stdoutHistory.length - 1;
-      broadcastToClients(stdoutClients, data, undefined, stdoutEventId);
-      combinedHistory.push({ type: "stdout", data });
-      combinedDropped = trimHistory(combinedHistory, combinedDropped);
-      const combinedEventId = combinedDropped + combinedHistory.length - 1;
-      broadcastToClients(combinedClients, data, "stdout", combinedEventId);
-      appendLog(stdoutLogPath, data);
-      appendLog(combinedLogPath, data);
+      handleStdoutData(stdoutDecoder.decode(chunk, { stream: true }));
     },
     close() {
       const remaining = stdoutDecoder.decode();
-      if (remaining) {
-        stdoutHistory.push(remaining);
-        broadcastToClients(stdoutClients, remaining, undefined, stdoutDropped + stdoutHistory.length - 1);
-        combinedHistory.push({ type: "stdout", data: remaining });
-        broadcastToClients(combinedClients, remaining, "stdout", combinedDropped + combinedHistory.length - 1);
-      }
+      if (remaining) handleStdoutData(remaining);
     },
   })).catch(err => {
     console.error("stdout pipe error:", err.message);
@@ -383,43 +451,18 @@ if (!spawnError) {
 
   proc.stderr.pipeTo(new WritableStream({
     write(chunk) {
-      const data = stderrDecoder.decode(chunk, { stream: true });
-      stderrHistory.push(data);
-      stderrDropped = trimHistory(stderrHistory, stderrDropped);
-      const stderrEventId = stderrDropped + stderrHistory.length - 1;
-      broadcastToClients(stderrClients, data, undefined, stderrEventId);
-      combinedHistory.push({ type: "stderr", data });
-      combinedDropped = trimHistory(combinedHistory, combinedDropped);
-      const combinedEventId = combinedDropped + combinedHistory.length - 1;
-      broadcastToClients(combinedClients, data, "stderr", combinedEventId);
-      appendLog(stderrLogPath, data);
-      appendLog(combinedLogPath, data);
+      handleStderrData(stderrDecoder.decode(chunk, { stream: true }));
     },
     close() {
       const remaining = stderrDecoder.decode();
-      if (remaining) {
-        stderrHistory.push(remaining);
-        broadcastToClients(stderrClients, remaining, undefined, stderrDropped + stderrHistory.length - 1);
-        combinedHistory.push({ type: "stderr", data: remaining });
-        broadcastToClients(combinedClients, remaining, "stderr", combinedDropped + combinedHistory.length - 1);
-      }
+      if (remaining) handleStderrData(remaining);
     },
   })).catch(err => {
     console.error("stderr pipe error:", err.message);
   });
 
-  // --- Process lifecycle ---
-
   proc.exited.then((code) => {
-    processExitCode = code;
-    processExited = true;
-    const message = exitMessage();
-    broadcastToClients(stdoutClients, message);
-    broadcastToClients(stderrClients, message);
-    broadcastToClients(combinedClients, message);
-    console.log(`\nProcess exited with code ${code}`);
-    updateMetadata(code);
-    shutdownIfIdle();
+    handleProcessExit(code);
   }).catch(err => {
     console.error("Process exited with error:", err.message);
     processExitCode = 1;
@@ -431,7 +474,7 @@ if (!spawnError) {
     updateMetadata(1);
     shutdownIfIdle();
   });
-} else {
+} else if (spawnError) {
   broadcastToClients(stdoutClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
   broadcastToClients(stderrClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
   broadcastToClients(combinedClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
@@ -445,8 +488,8 @@ function shutdown(reason: string) {
   hasShutdown = true;
   console.log(`\n${reason}`);
   stopHeartbeat();
-  if (proc && !processExited) {
-    try { proc.kill(); } catch { /* already dead */ }
+  if (!processExited) {
+    try { killChild(); } catch { /* already dead */ }
   }
   server.stop();
 }
@@ -480,9 +523,6 @@ setTimeout(() => {
 // Forward signals to child process and clean up
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
-    if (proc && !processExited) {
-      try { proc.kill(); } catch { /* already dead */ }
-    }
     shutdown(`Received ${sig}, shutting down...`);
     process.exit(0);
   });
