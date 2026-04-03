@@ -172,19 +172,20 @@ function stopHeartbeat() {
 
 // --- SSE helpers ---
 
-function encodeSSE(data: string, eventType?: string): Uint8Array {
+function encodeSSE(data: string, eventType?: string, id?: number): Uint8Array {
   const base64 = btoa(unescape(encodeURIComponent(data)));
+  const idLine = id !== undefined ? `id: ${id}\n` : "";
   const eventLine = eventType ? `event: ${eventType}\n` : "";
-  return textEncoder.encode(`${eventLine}data: ${base64}\n\n`);
+  return textEncoder.encode(`${idLine}${eventLine}data: ${base64}\n\n`);
 }
 
-function sendToClient(client: ReadableStreamDefaultController, data: string, eventType?: string) {
-  try { client.enqueue(encodeSSE(data, eventType)); } catch { /* client disconnected */ }
+function sendToClient(client: ReadableStreamDefaultController, data: string, eventType?: string, id?: number) {
+  try { client.enqueue(encodeSSE(data, eventType, id)); } catch { /* client disconnected */ }
 }
 
-function broadcastToClients(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string) {
+function broadcastToClients(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string, id?: number) {
   if (!clients.size) return;
-  const encoded = encodeSSE(data, eventType);
+  const encoded = encodeSSE(data, eventType, id);
   for (const client of clients) {
     try { client.enqueue(encoded); } catch { clients.delete(client); }
   }
@@ -235,7 +236,9 @@ try {
 
 // --- HTTP server ---
 
-function parseReplayOffset(url: URL): number {
+function parseReplayOffset(req: Request, url: URL): number {
+  const lastEventId = req.headers.get("Last-Event-ID");
+  if (lastEventId) return parseInt(lastEventId, 10) + 1 || 0;
   return Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
 }
 
@@ -271,30 +274,30 @@ const server = Bun.serve({
     }
 
     if (pathname === "/stdout") {
-      const from = parseReplayOffset(url);
+      const from = parseReplayOffset(req, url);
       return new Response(createSSEStream(stdoutClients, client => {
         const idx = Math.max(0, from - stdoutDropped);
-        for (let i = idx; i < stdoutHistory.length; i++) sendToClient(client, stdoutHistory[i]);
+        for (let i = idx; i < stdoutHistory.length; i++) sendToClient(client, stdoutHistory[i], undefined, stdoutDropped + i);
         if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
 
     if (pathname === "/stderr") {
-      const from = parseReplayOffset(url);
+      const from = parseReplayOffset(req, url);
       return new Response(createSSEStream(stderrClients, client => {
         const idx = Math.max(0, from - stderrDropped);
-        for (let i = idx; i < stderrHistory.length; i++) sendToClient(client, stderrHistory[i]);
+        for (let i = idx; i < stderrHistory.length; i++) sendToClient(client, stderrHistory[i], undefined, stderrDropped + i);
         if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
 
     if (pathname === "/combined") {
-      const from = parseReplayOffset(url);
+      const from = parseReplayOffset(req, url);
       return new Response(createSSEStream(combinedClients, client => {
         const idx = Math.max(0, from - combinedDropped);
         for (let i = idx; i < combinedHistory.length; i++) {
           const { type, data } = combinedHistory[i];
-          sendToClient(client, data, type);
+          sendToClient(client, data, type, combinedDropped + i);
         }
         if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
@@ -315,10 +318,12 @@ if (!spawnError) {
       const data = stdoutDecoder.decode(chunk, { stream: true });
       stdoutHistory.push(data);
       stdoutDropped = trimHistory(stdoutHistory, stdoutDropped);
-      broadcastToClients(stdoutClients, data);
+      const stdoutEventId = stdoutDropped + stdoutHistory.length - 1;
+      broadcastToClients(stdoutClients, data, undefined, stdoutEventId);
       combinedHistory.push({ type: "stdout", data });
       combinedDropped = trimHistory(combinedHistory, combinedDropped);
-      broadcastToClients(combinedClients, data, "stdout");
+      const combinedEventId = combinedDropped + combinedHistory.length - 1;
+      broadcastToClients(combinedClients, data, "stdout", combinedEventId);
       appendLog(stdoutLogPath, data);
       appendLog(combinedLogPath, data);
     },
@@ -326,9 +331,9 @@ if (!spawnError) {
       const remaining = stdoutDecoder.decode();
       if (remaining) {
         stdoutHistory.push(remaining);
-        broadcastToClients(stdoutClients, remaining);
+        broadcastToClients(stdoutClients, remaining, undefined, stdoutDropped + stdoutHistory.length - 1);
         combinedHistory.push({ type: "stdout", data: remaining });
-        broadcastToClients(combinedClients, remaining, "stdout");
+        broadcastToClients(combinedClients, remaining, "stdout", combinedDropped + combinedHistory.length - 1);
       }
     },
   })).catch(err => {
@@ -340,10 +345,12 @@ if (!spawnError) {
       const data = stderrDecoder.decode(chunk, { stream: true });
       stderrHistory.push(data);
       stderrDropped = trimHistory(stderrHistory, stderrDropped);
-      broadcastToClients(stderrClients, data);
+      const stderrEventId = stderrDropped + stderrHistory.length - 1;
+      broadcastToClients(stderrClients, data, undefined, stderrEventId);
       combinedHistory.push({ type: "stderr", data });
       combinedDropped = trimHistory(combinedHistory, combinedDropped);
-      broadcastToClients(combinedClients, data, "stderr");
+      const combinedEventId = combinedDropped + combinedHistory.length - 1;
+      broadcastToClients(combinedClients, data, "stderr", combinedEventId);
       appendLog(stderrLogPath, data);
       appendLog(combinedLogPath, data);
     },
@@ -351,9 +358,9 @@ if (!spawnError) {
       const remaining = stderrDecoder.decode();
       if (remaining) {
         stderrHistory.push(remaining);
-        broadcastToClients(stderrClients, remaining);
+        broadcastToClients(stderrClients, remaining, undefined, stderrDropped + stderrHistory.length - 1);
         combinedHistory.push({ type: "stderr", data: remaining });
-        broadcastToClients(combinedClients, remaining, "stderr");
+        broadcastToClients(combinedClients, remaining, "stderr", combinedDropped + combinedHistory.length - 1);
       }
     },
   })).catch(err => {
@@ -782,24 +789,24 @@ const HTML = `<!DOCTYPE html>
       connect();
     }
 
-    // Track position in server-side history so reconnects resume without duplicates
-    let stdoutOffset = 0, stderrOffset = 0, combinedOffset = 0;
+    // Track last event ID for reconnect resume
+    let stdoutLastId = -1, stderrLastId = -1, combinedLastId = -1;
 
-    connectSSE(() => '/stdout?from=' + stdoutOffset, source => {
-      source.onmessage = e => { stdoutOffset++; writeToTerminal(panels.stdout.terminal, decodeBase64(e.data)); };
+    connectSSE(() => '/stdout' + (stdoutLastId >= 0 ? '?from=' + (stdoutLastId + 1) : ''), source => {
+      source.onmessage = e => { if (e.lastEventId) stdoutLastId = parseInt(e.lastEventId); writeToTerminal(panels.stdout.terminal, decodeBase64(e.data)); };
     });
 
-    connectSSE(() => '/stderr?from=' + stderrOffset, source => {
-      source.onmessage = e => { stderrOffset++; writeToTerminal(panels.stderr.terminal, decodeBase64(e.data)); };
+    connectSSE(() => '/stderr' + (stderrLastId >= 0 ? '?from=' + (stderrLastId + 1) : ''), source => {
+      source.onmessage = e => { if (e.lastEventId) stderrLastId = parseInt(e.lastEventId); writeToTerminal(panels.stderr.terminal, decodeBase64(e.data)); };
     });
 
-    connectSSE(() => '/combined?from=' + combinedOffset, source => {
+    connectSSE(() => '/combined' + (combinedLastId >= 0 ? '?from=' + (combinedLastId + 1) : ''), source => {
       source.addEventListener('stdout', e => {
-        combinedOffset++;
+        if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
         writeToTerminal(panels.combined.terminal, decodeBase64(e.data));
       });
       source.addEventListener('stderr', e => {
-        combinedOffset++;
+        if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
         writeToTerminal(panels.combined.terminal, '\\x1b[31m' + decodeBase64(e.data) + '\\x1b[0m');
       });
       source.onmessage = e => writeToTerminal(panels.combined.terminal, decodeBase64(e.data));

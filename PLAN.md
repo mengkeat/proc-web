@@ -103,13 +103,13 @@ These changes protect the app under long-running and high-volume workloads.
 **Why:** Chunk-count offsets work, but proper event IDs are more robust and standard.
 
 **Tasks**
-- Assign monotonically increasing event IDs
-- Emit SSE `id:` fields
-- Support reconnect with `Last-Event-ID`
-- Keep replay logic compatible with bounded memory and disk logs
+- [x] Assign monotonically increasing event IDs
+- [x] Emit SSE `id:` fields
+- [x] Support reconnect with `Last-Event-ID`
+- [x] Keep replay logic compatible with bounded memory and disk logs
 
 **Done when**
-- Reconnects resume accurately without duplicate or skipped output
+- [x] Reconnects resume accurately without duplicate or skipped output
 
 ### 1.4 Handle slow clients gracefully
 **Priority:** High  
