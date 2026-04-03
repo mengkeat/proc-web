@@ -2,10 +2,11 @@ import { spawn } from "bun";
 
 // --- CLI argument parsing ---
 
-function parseArgs(argv: string[]): { port: number; maxHistory: number; command: string[] } {
+function parseArgs(argv: string[]): { port: number; maxHistory: number; logDir: string | null; command: string[] } {
   const args = argv.slice(2);
   let port = 3000;
   let maxHistory = 10000; // max chunks to keep in memory
+  let logDir: string | null = null;
   const command: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -23,21 +24,73 @@ function parseArgs(argv: string[]): { port: number; maxHistory: number; command:
         process.exit(1);
       }
       maxHistory = val;
+    } else if (args[i] === "--log-dir") {
+      logDir = args[++i];
+      if (!logDir) {
+        console.error("Missing log-dir path");
+        process.exit(1);
+      }
     } else {
       command.push(args[i]);
     }
   }
 
   if (command.length === 0) {
-    console.error("Usage: bun run server.ts [--port N] [--max-history N] <command> [args...]");
+    console.error("Usage: bun run server.ts [--port N] [--max-history N] [--log-dir DIR] <command> [args...]");
     console.error("Example: bun run server.ts ls -la");
     process.exit(1);
   }
 
-  return { port, maxHistory, command };
+  return { port, maxHistory, logDir, command };
 }
 
-const { port: PORT, maxHistory: MAX_HISTORY, command } = parseArgs(Bun.argv);
+const { port: PORT, maxHistory: MAX_HISTORY, logDir: LOG_DIR, command } = parseArgs(Bun.argv);
+
+// --- Disk-backed log persistence ---
+
+import { mkdirSync, appendFileSync, writeFileSync } from "fs";
+import { join } from "path";
+
+let logSessionDir: string | null = null;
+let stdoutLogPath: string | null = null;
+let stderrLogPath: string | null = null;
+let combinedLogPath: string | null = null;
+let metadataPath: string | null = null;
+const startTime = Date.now();
+
+if (LOG_DIR) {
+  const sessionId = new Date().toISOString().replace(/[:.]/g, "-");
+  logSessionDir = join(LOG_DIR, sessionId);
+  mkdirSync(logSessionDir, { recursive: true });
+  stdoutLogPath = join(logSessionDir, "stdout.log");
+  stderrLogPath = join(logSessionDir, "stderr.log");
+  combinedLogPath = join(logSessionDir, "combined.log");
+  metadataPath = join(logSessionDir, "metadata.json");
+  writeFileSync(metadataPath, JSON.stringify({
+    command,
+    startTime: new Date(startTime).toISOString(),
+    pid: process.pid,
+  }, null, 2));
+}
+
+function appendLog(path: string | null, data: string) {
+  if (path) try { appendFileSync(path, data); } catch { /* ignore */ }
+}
+
+function updateMetadata(exitCode: number) {
+  if (metadataPath) {
+    try {
+      writeFileSync(metadataPath, JSON.stringify({
+        command,
+        startTime: new Date(startTime).toISOString(),
+        endTime: new Date().toISOString(),
+        durationMs: Date.now() - startTime,
+        exitCode,
+        pid: process.pid,
+      }, null, 2));
+    } catch { /* ignore */ }
+  }
+}
 
 // --- Startup info ---
 
@@ -266,6 +319,8 @@ if (!spawnError) {
       combinedHistory.push({ type: "stdout", data });
       combinedDropped = trimHistory(combinedHistory, combinedDropped);
       broadcastToClients(combinedClients, data, "stdout");
+      appendLog(stdoutLogPath, data);
+      appendLog(combinedLogPath, data);
     },
     close() {
       const remaining = stdoutDecoder.decode();
@@ -289,6 +344,8 @@ if (!spawnError) {
       combinedHistory.push({ type: "stderr", data });
       combinedDropped = trimHistory(combinedHistory, combinedDropped);
       broadcastToClients(combinedClients, data, "stderr");
+      appendLog(stderrLogPath, data);
+      appendLog(combinedLogPath, data);
     },
     close() {
       const remaining = stderrDecoder.decode();
@@ -313,6 +370,7 @@ if (!spawnError) {
     broadcastToClients(stderrClients, message);
     broadcastToClients(combinedClients, message);
     console.log(`\nProcess exited with code ${code}`);
+    updateMetadata(code);
     shutdownIfIdle();
   }).catch(err => {
     console.error("Process exited with error:", err.message);
@@ -322,6 +380,7 @@ if (!spawnError) {
     broadcastToClients(stdoutClients, message);
     broadcastToClients(stderrClients, message);
     broadcastToClients(combinedClients, message);
+    updateMetadata(1);
     shutdownIfIdle();
   });
 } else {

@@ -90,13 +90,13 @@ These changes protect the app under long-running and high-volume workloads.
 **Why:** Full output should survive long runs, client disconnects, and future session UX.
 
 **Tasks**
-- Append stdout/stderr/combined events to disk
-- Persist metadata: command, start time, exit code, duration
-- Use a simple format such as JSONL or append-only text/event logs
-- Keep recent tail in memory, full history on disk
+- [x] Append stdout/stderr/combined events to disk
+- [x] Persist metadata: command, start time, exit code, duration
+- [x] Use a simple format such as JSONL or append-only text/event logs
+- [x] Keep recent tail in memory, full history on disk
 
 **Done when**
-- Full logs can be replayed/downloaded even after large output volumes
+- [x] Full logs can be replayed/downloaded even after large output volumes
 
 ### 1.3 Introduce structured event IDs
 **Priority:** High  
