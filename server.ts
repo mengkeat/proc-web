@@ -1,91 +1,113 @@
 import { spawn } from "bun";
 
-// Parse --port flag and extract command
-let PORT = 3000;
-const rawArgs = Bun.argv.slice(2);
-const portIdx = rawArgs.indexOf("--port");
-if (portIdx !== -1 && rawArgs[portIdx + 1]) {
-  const p = parseInt(rawArgs[portIdx + 1], 10);
-  if (!isNaN(p) && p > 0 && p <= 65535) PORT = p;
-  else { console.error("Invalid port number"); process.exit(1); }
+// --- CLI argument parsing ---
+
+function parseArgs(argv: string[]): { port: number; command: string[] } {
+  const args = argv.slice(2);
+  let port = 3000;
+  const command: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--port") {
+      const portValue = parseInt(args[++i], 10);
+      if (isNaN(portValue) || portValue < 1 || portValue > 65535) {
+        console.error("Invalid port number");
+        process.exit(1);
+      }
+      port = portValue;
+    } else {
+      command.push(args[i]);
+    }
+  }
+
+  if (command.length === 0) {
+    console.error("Usage: bun run server.ts [--port N] <command> [args...]");
+    console.error("Example: bun run server.ts ls -la");
+    process.exit(1);
+  }
+
+  return { port, command };
 }
 
-const command: string[] = [];
-for (let i = 0; i < rawArgs.length; i++) {
-  if (rawArgs[i] === "--port") { i++; continue; }
-  command.push(rawArgs[i]);
-}
+const { port: PORT, command } = parseArgs(Bun.argv);
 
-if (command.length === 0) {
-  console.error("Usage: bun run server.ts [--port N] <command> [args...]");
-  console.error("Example: bun run server.ts ls -la");
-  process.exit(1);
-}
+// --- Startup info ---
 
-const os = require("os") as typeof import("os");
-const wslIP =
-  os.networkInterfaces()["eth0"]?.[0]?.address ||
-  os.networkInterfaces()["ens3"]?.[0]?.address ||
-  os.networkInterfaces()["enp0s3"]?.[0]?.address ||
-  null;
+function getLocalNetworkIP(): string | null {
+  const os = require("os") as typeof import("os");
+  const interfaces = os.networkInterfaces();
+  for (const name of ["eth0", "ens3", "enp0s3"]) {
+    const address = interfaces[name]?.[0]?.address;
+    if (address) return address;
+  }
+  return null;
+}
 
 console.log(`Starting: ${command.join(" ")}`);
 console.log(`Open http://localhost:${PORT} in your browser`);
-if (wslIP) console.log(`Open http://${wslIP}:${PORT} in your Windows browser`);
+const localIP = getLocalNetworkIP();
+if (localIP) console.log(`Open http://${localIP}:${PORT} in your Windows browser`);
 
-function escapeHtml(s: string) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-const cmdHtml = escapeHtml(command.join(" "));
+const commandHtml = escapeHtml(command.join(" "));
 
-// Process state
-let processCompleted = false;
-let exitCode: number | null = null;
+// --- Process state ---
 
-// History buffers (for late-connecting / reconnecting clients)
-const stdoutBuffer: string[] = [];
-const stderrBuffer: string[] = [];
-const combinedBuffer: { type: "stdout" | "stderr"; data: string }[] = [];
+let processExited = false;
+let processExitCode: number | null = null;
 
-// Multi-client SSE controller sets
-const stdoutCtls = new Set<ReadableStreamDefaultController>();
-const stderrCtls = new Set<ReadableStreamDefaultController>();
-const combinedCtls = new Set<ReadableStreamDefaultController>();
+// Buffers for late-connecting / reconnecting clients
+const stdoutHistory: string[] = [];
+const stderrHistory: string[] = [];
+const combinedHistory: { type: "stdout" | "stderr"; data: string }[] = [];
 
-let activeConnections = 0;
-const enc = new TextEncoder();
+// Active SSE client connections per stream
+const stdoutClients = new Set<ReadableStreamDefaultController>();
+const stderrClients = new Set<ReadableStreamDefaultController>();
+const combinedClients = new Set<ReadableStreamDefaultController>();
 
-function sseBytes(data: string, eventType?: string): Uint8Array {
-  const b64 = btoa(unescape(encodeURIComponent(data)));
-  const evtLine = eventType ? `event: ${eventType}\n` : "";
-  return enc.encode(`${evtLine}data: ${b64}\n\n`);
+let activeConnectionCount = 0;
+const textEncoder = new TextEncoder();
+
+// --- SSE helpers ---
+
+function encodeSSE(data: string, eventType?: string): Uint8Array {
+  const base64 = btoa(unescape(encodeURIComponent(data)));
+  const eventLine = eventType ? `event: ${eventType}\n` : "";
+  return textEncoder.encode(`${eventLine}data: ${base64}\n\n`);
 }
 
-function sendEvent(ctrl: ReadableStreamDefaultController, data: string, eventType?: string) {
-  try { ctrl.enqueue(sseBytes(data, eventType)); } catch { /* client disconnected */ }
+function sendToClient(client: ReadableStreamDefaultController, data: string, eventType?: string) {
+  try { client.enqueue(encodeSSE(data, eventType)); } catch { /* client disconnected */ }
 }
 
-function broadcast(ctls: Set<ReadableStreamDefaultController>, data: string, eventType?: string) {
-  if (!ctls.size) return;
-  const b64 = btoa(unescape(encodeURIComponent(data)));
-  const evtLine = eventType ? `event: ${eventType}\n` : "";
-  const message = `${evtLine}data: ${b64}\n\n`;
-  const failed: ReadableStreamDefaultController[] = [];
-  for (const ctrl of ctls) {
-    try { ctrl.enqueue(enc.encode(message)); } catch { failed.push(ctrl); }
+function broadcastToClients(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string) {
+  if (!clients.size) return;
+  const encoded = encodeSSE(data, eventType);
+  for (const client of clients) {
+    try { client.enqueue(encoded); } catch { clients.delete(client); }
   }
-  for (const ctrl of failed) ctls.delete(ctrl);
 }
 
-function makeSSEStream(
-  ctls: Set<ReadableStreamDefaultController>,
-  replay: (ctrl: ReadableStreamDefaultController) => void
+function createSSEStream(
+  clients: Set<ReadableStreamDefaultController>,
+  replayHistory: (client: ReadableStreamDefaultController) => void
 ): ReadableStream {
-  activeConnections++;
-  let mine!: ReadableStreamDefaultController;
+  activeConnectionCount++;
+  let thisClient!: ReadableStreamDefaultController;
   return new ReadableStream({
-    start(ctrl) { mine = ctrl; ctls.add(ctrl); replay(ctrl); },
-    cancel() { activeConnections--; ctls.delete(mine); checkShutdown(); },
+    start(controller) {
+      thisClient = controller;
+      clients.add(controller);
+      replayHistory(controller);
+    },
+    cancel() {
+      activeConnectionCount--;
+      clients.delete(thisClient);
+      shutdownIfIdle();
+    },
   });
 }
 
@@ -95,8 +117,17 @@ const SSE_HEADERS = {
   Connection: "keep-alive",
 };
 
-// Spawn the process
+// --- Spawn the child process ---
+
 const proc = spawn({ cmd: command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+
+// --- HTTP server ---
+
+function parseReplayOffset(url: URL): number {
+  return Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
+}
+
+const exitMessage = () => `\r\n[Process exited with code ${processExitCode}]\r\n`;
 
 const server = Bun.serve({
   port: PORT,
@@ -111,49 +142,46 @@ const server = Bun.serve({
     }
 
     if (pathname === "/status") {
-      return new Response(
-        JSON.stringify({ running: !processCompleted, exitCode }),
-        { headers: { "Content-Type": "application/json" } }
-      );
+      return Response.json({ running: !processExited, exitCode: processExitCode });
     }
 
     if (pathname === "/kill" && req.method === "POST") {
-      if (!processCompleted) proc.kill();
-      return new Response(`{"ok":true}`, { headers: { "Content-Type": "application/json" } });
+      if (!processExited) proc.kill();
+      return Response.json({ ok: true });
     }
 
     if (pathname === "/stdin" && req.method === "POST") {
-      if (!processCompleted) {
+      if (!processExited) {
         const text = await req.text();
-        try { proc.stdin.write(text + "\n"); await proc.stdin.flush(); } catch { /* ignore */ }
+        try { proc.stdin.write(text + "\n"); await proc.stdin.flush(); } catch { /* closed */ }
       }
-      return new Response(`{"ok":true}`, { headers: { "Content-Type": "application/json" } });
+      return Response.json({ ok: true });
     }
 
     if (pathname === "/stdout") {
-      const from = Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
-      return new Response(makeSSEStream(stdoutCtls, ctrl => {
-        for (let i = from; i < stdoutBuffer.length; i++) sendEvent(ctrl, stdoutBuffer[i]);
-        if (processCompleted) sendEvent(ctrl, `\r\n[Process exited with code ${exitCode}]\r\n`);
+      const from = parseReplayOffset(url);
+      return new Response(createSSEStream(stdoutClients, client => {
+        for (let i = from; i < stdoutHistory.length; i++) sendToClient(client, stdoutHistory[i]);
+        if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
 
     if (pathname === "/stderr") {
-      const from = Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
-      return new Response(makeSSEStream(stderrCtls, ctrl => {
-        for (let i = from; i < stderrBuffer.length; i++) sendEvent(ctrl, stderrBuffer[i]);
-        if (processCompleted) sendEvent(ctrl, `\r\n[Process exited with code ${exitCode}]\r\n`);
+      const from = parseReplayOffset(url);
+      return new Response(createSSEStream(stderrClients, client => {
+        for (let i = from; i < stderrHistory.length; i++) sendToClient(client, stderrHistory[i]);
+        if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
 
     if (pathname === "/combined") {
-      const from = Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
-      return new Response(makeSSEStream(combinedCtls, ctrl => {
-        for (let i = from; i < combinedBuffer.length; i++) {
-          const { type, data } = combinedBuffer[i];
-          sendEvent(ctrl, data, type);
+      const from = parseReplayOffset(url);
+      return new Response(createSSEStream(combinedClients, client => {
+        for (let i = from; i < combinedHistory.length; i++) {
+          const { type, data } = combinedHistory[i];
+          sendToClient(client, data, type);
         }
-        if (processCompleted) sendEvent(ctrl, `\r\n[Process exited with code ${exitCode}]\r\n`);
+        if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
 
@@ -161,54 +189,55 @@ const server = Bun.serve({
   },
 });
 
-// Stream stdout
+// --- Pipe process output to SSE clients ---
+
+const textDecoder = new TextDecoder();
+
 proc.stdout.pipeTo(new WritableStream({
   write(chunk) {
-    const data = new TextDecoder().decode(chunk);
-    stdoutBuffer.push(data);
-    broadcast(stdoutCtls, data);
-    combinedBuffer.push({ type: "stdout", data });
-    broadcast(combinedCtls, data, "stdout");
+    const data = textDecoder.decode(chunk);
+    stdoutHistory.push(data);
+    broadcastToClients(stdoutClients, data);
+    combinedHistory.push({ type: "stdout", data });
+    broadcastToClients(combinedClients, data, "stdout");
   },
 }));
 
-// Stream stderr
 proc.stderr.pipeTo(new WritableStream({
   write(chunk) {
-    const data = new TextDecoder().decode(chunk);
-    stderrBuffer.push(data);
-    broadcast(stderrCtls, data);
-    combinedBuffer.push({ type: "stderr", data });
-    broadcast(combinedCtls, data, "stderr");
+    const data = textDecoder.decode(chunk);
+    stderrHistory.push(data);
+    broadcastToClients(stderrClients, data);
+    combinedHistory.push({ type: "stderr", data });
+    broadcastToClients(combinedClients, data, "stderr");
   },
 }));
 
-// Handle process exit
+// --- Process lifecycle ---
+
 proc.exited.then((code) => {
-  exitCode = code;
-  processCompleted = true;
-  const msg = `\r\n[Process exited with code ${code}]\r\n`;
-  broadcast(stdoutCtls, msg);
-  broadcast(stderrCtls, msg);
-  broadcast(combinedCtls, msg);
+  processExitCode = code;
+  processExited = true;
+  const message = exitMessage();
+  broadcastToClients(stdoutClients, message);
+  broadcastToClients(stderrClients, message);
+  broadcastToClients(combinedClients, message);
   console.log(`\nProcess exited with code ${code}`);
-  checkShutdown();
+  shutdownIfIdle();
 });
 
-function checkShutdown() {
-  if (processCompleted && activeConnections === 0) {
-    setTimeout(() => {
-      if (activeConnections === 0) {
-        console.log("\nAll clients disconnected, shutting down...");
-        server.stop();
-      }
-    }, 5000);
-  }
+function shutdownIfIdle() {
+  if (!processExited || activeConnectionCount > 0) return;
+  setTimeout(() => {
+    if (activeConnectionCount === 0) {
+      console.log("\nAll clients disconnected, shutting down...");
+      server.stop();
+    }
+  }, 5000);
 }
 
-// Auto-shutdown if no clients connect within 60s
 setTimeout(() => {
-  if (activeConnections === 0) {
+  if (activeConnectionCount === 0) {
     console.log("\nNo clients connected, shutting down...");
     server.stop();
   }
@@ -219,7 +248,7 @@ const HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>proc-web: ${cmdHtml}</title>
+  <title>proc-web: ${commandHtml}</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -321,12 +350,34 @@ const HTML = `<!DOCTYPE html>
       min-width: 0;
     }
     .stdin-area input:focus { outline: none; border-color: #4ec9b0; }
+    .search-bar {
+      display: none;
+      background: #252526;
+      border-bottom: 1px solid #3d3d3d;
+      padding: 6px 12px;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .search-bar.visible { display: flex; }
+    .search-bar input {
+      background: #1e1e1e;
+      border: 1px solid #4a4a4a;
+      color: #d4d4d4;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-family: Monaco, Menlo, 'Courier New', monospace;
+      font-size: 13px;
+      width: 260px;
+    }
+    .search-bar input:focus { outline: none; border-color: #4ec9b0; }
+    .search-bar .search-count { font-size: 11px; color: #888; min-width: 20px; }
   </style>
 </head>
 <body>
   <header>
     <span class="logo">proc-web</span>
-    <span class="command" title="${cmdHtml}">${cmdHtml}</span>
+    <span class="command" title="${commandHtml}">${commandHtml}</span>
     <div class="header-right">
       <span id="status-el" class="status-running">● Running</span>
       <button id="kill-btn" class="btn btn-danger" onclick="killProcess()">Kill</button>
@@ -340,9 +391,18 @@ const HTML = `<!DOCTYPE html>
       <button class="tab" data-tab="combined" onclick="switchTab('combined')">COMBINED</button>
     </div>
     <div class="tab-actions">
+      <button class="btn" onclick="toggleSearch()">🔍 Search</button>
       <button id="scroll-btn" class="btn" onclick="toggleScroll()">⏸ Pause</button>
       <button class="btn" onclick="downloadOutput()">⬇ Save</button>
     </div>
+  </div>
+
+  <div id="search-bar" class="search-bar">
+    <input type="text" id="search-input" placeholder="Search…" autocomplete="off" spellcheck="false" />
+    <button class="btn" onclick="searchPrev()">▲</button>
+    <button class="btn" onclick="searchNext()">▼</button>
+    <span id="search-count" class="search-count"></span>
+    <button class="btn" onclick="closeSearch()">✕</button>
   </div>
 
   <div class="panels">
@@ -365,8 +425,9 @@ const HTML = `<!DOCTYPE html>
 
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.js"></script>
   <script>
-    const TERM_BASE = {
+    const TERMINAL_OPTIONS = {
       fontSize: 14,
       fontFamily: 'Monaco, Menlo, "Courier New", monospace',
       theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
@@ -374,31 +435,27 @@ const HTML = `<!DOCTYPE html>
       scrollback: 10000,
     };
 
-    const stdoutTerm = new Terminal(TERM_BASE);
-    const stderrTerm = new Terminal({ ...TERM_BASE, theme: { background: '#1e1e1e', foreground: '#f14c4c' } });
-    const combinedTerm = new Terminal(TERM_BASE);
-
-    const stdoutFit = new FitAddon.FitAddon();
-    const stderrFit = new FitAddon.FitAddon();
-    const combinedFit = new FitAddon.FitAddon();
-
-    stdoutTerm.loadAddon(stdoutFit);
-    stderrTerm.loadAddon(stderrFit);
-    combinedTerm.loadAddon(combinedFit);
-
-    stdoutTerm.open(document.getElementById('stdout-terminal'));
-    stderrTerm.open(document.getElementById('stderr-terminal'));
-    combinedTerm.open(document.getElementById('combined-terminal'));
-
-    const terms = { stdout: stdoutTerm, stderr: stderrTerm, combined: combinedTerm };
-    const fits  = { stdout: stdoutFit,  stderr: stderrFit,  combined: combinedFit  };
-
-    // Only fit the active panel (hidden panels have 0 dimensions)
-    function fitActive() {
-      try { fits[currentTab].fit(); } catch (_) {}
+    function createPanel(elementId, terminalOptions) {
+      const terminal = new Terminal(terminalOptions || TERMINAL_OPTIONS);
+      const fitAddon = new FitAddon.FitAddon();
+      const searchAddon = new SearchAddon.SearchAddon();
+      terminal.loadAddon(fitAddon);
+      terminal.loadAddon(searchAddon);
+      terminal.open(document.getElementById(elementId));
+      return { terminal, fitAddon, searchAddon };
     }
-    fitActive();
-    window.addEventListener('resize', fitActive);
+
+    const panels = {
+      stdout:   createPanel('stdout-terminal'),
+      stderr:   createPanel('stderr-terminal', { ...TERMINAL_OPTIONS, theme: { background: '#1e1e1e', foreground: '#f14c4c' } }),
+      combined: createPanel('combined-terminal'),
+    };
+
+    function fitActivePanel() {
+      try { panels[currentTab].fitAddon.fit(); } catch (_) {}
+    }
+    fitActivePanel();
+    window.addEventListener('resize', fitActivePanel);
 
     // --- Tab switching ---
     let currentTab = 'stdout';
@@ -408,8 +465,8 @@ const HTML = `<!DOCTYPE html>
         t.classList.toggle('active', t.dataset.tab === name));
       document.querySelectorAll('.panel').forEach(p =>
         p.classList.toggle('active', p.id === 'panel-' + name));
-      try { fits[name].fit(); } catch (_) {}
-      if (autoScroll) terms[name].scrollToBottom();
+      try { panels[name].fitAddon.fit(); } catch (_) {}
+      if (autoScroll) panels[name].terminal.scrollToBottom();
     }
 
     // --- Auto-scroll ---
@@ -418,12 +475,12 @@ const HTML = `<!DOCTYPE html>
       autoScroll = !autoScroll;
       const btn = document.getElementById('scroll-btn');
       btn.textContent = autoScroll ? '\\u23f8 Pause' : '\\u25b6 Resume';
-      if (autoScroll) Object.values(terms).forEach(t => t.scrollToBottom());
+      if (autoScroll) Object.values(panels).forEach(p => p.terminal.scrollToBottom());
     }
 
-    function writeTerm(term, data) {
-      term.write(data);
-      if (autoScroll) term.scrollToBottom();
+    function writeToTerminal(terminal, data) {
+      terminal.write(data);
+      if (autoScroll) terminal.scrollToBottom();
     }
 
     // --- Process status polling ---
@@ -466,8 +523,8 @@ const HTML = `<!DOCTYPE html>
 
     // --- Download current tab output ---
     function downloadOutput() {
-      const term = terms[currentTab];
-      const buf = term.buffer.active;
+      const { terminal } = panels[currentTab];
+      const buf = terminal.buffer.active;
       const lines = [];
       for (let i = 0; i < buf.length; i++) {
         lines.push(buf.getLine(i)?.translateToString(true) ?? '');
@@ -481,53 +538,101 @@ const HTML = `<!DOCTYPE html>
       URL.revokeObjectURL(a.href);
     }
 
+    // --- Search ---
+    let searchVisible = false;
+    function toggleSearch() {
+      searchVisible = !searchVisible;
+      const bar = document.getElementById('search-bar');
+      bar.classList.toggle('visible', searchVisible);
+      if (searchVisible) {
+        document.getElementById('search-input').focus();
+      } else {
+        closeSearch();
+      }
+    }
+    function closeSearch() {
+      searchVisible = false;
+      document.getElementById('search-bar').classList.remove('visible');
+      document.getElementById('search-input').value = '';
+      document.getElementById('search-count').textContent = '';
+      panels[currentTab].searchAddon.clearDecorations();
+    }
+    function searchNext() {
+      const q = document.getElementById('search-input').value;
+      if (q) panels[currentTab].searchAddon.findNext(q);
+    }
+    function searchPrev() {
+      const q = document.getElementById('search-input').value;
+      if (q) panels[currentTab].searchAddon.findPrevious(q);
+    }
+    document.getElementById('search-input').addEventListener('input', e => {
+      const q = e.target.value;
+      if (q) {
+        panels[currentTab].searchAddon.findNext(q);
+      } else {
+        panels[currentTab].searchAddon.clearDecorations();
+        document.getElementById('search-count').textContent = '';
+      }
+    });
+    document.getElementById('search-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.shiftKey ? searchPrev() : searchNext();
+      } else if (e.key === 'Escape') {
+        closeSearch();
+      }
+    });
+    document.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        if (!searchVisible) toggleSearch();
+        else document.getElementById('search-input').focus();
+      }
+    });
+
     // --- SSE helpers ---
-    function decode(b64) {
-      return decodeURIComponent(escape(atob(b64)));
+
+    function decodeBase64(encoded) {
+      return decodeURIComponent(escape(atob(encoded)));
     }
 
-    // SSE connection with exponential-backoff reconnect + incremental replay via ?from=N
-    function connectSSE(getUrl, setup) {
-      let delay = 1000;
+    function connectSSE(buildUrl, onConnect) {
+      let retryDelay = 1000;
       function connect() {
-        const es = new EventSource(getUrl());
-        es.onopen = () => { delay = 1000; };
-        setup(es);
-        es.onerror = () => {
-          es.close();
+        const source = new EventSource(buildUrl());
+        source.onopen = () => { retryDelay = 1000; };
+        onConnect(source);
+        source.onerror = () => {
+          source.close();
           if (!processExited) {
-            setTimeout(connect, delay);
-            delay = Math.min(delay * 2, 30000);
+            setTimeout(connect, retryDelay);
+            retryDelay = Math.min(retryDelay * 2, 30000);
           }
         };
       }
       connect();
     }
 
-    // Counters track our position in the server-side buffer arrays
-    // so reconnects resume from where we left off without duplicates
-    let soIdx = 0, seIdx = 0, coIdx = 0;
+    // Track position in server-side history so reconnects resume without duplicates
+    let stdoutOffset = 0, stderrOffset = 0, combinedOffset = 0;
 
-    connectSSE(() => '/stdout?from=' + soIdx, es => {
-      es.onmessage = e => { soIdx++; writeTerm(stdoutTerm, decode(e.data)); };
+    connectSSE(() => '/stdout?from=' + stdoutOffset, source => {
+      source.onmessage = e => { stdoutOffset++; writeToTerminal(panels.stdout.terminal, decodeBase64(e.data)); };
     });
 
-    connectSSE(() => '/stderr?from=' + seIdx, es => {
-      es.onmessage = e => { seIdx++; writeTerm(stderrTerm, decode(e.data)); };
+    connectSSE(() => '/stderr?from=' + stderrOffset, source => {
+      source.onmessage = e => { stderrOffset++; writeToTerminal(panels.stderr.terminal, decodeBase64(e.data)); };
     });
 
-    connectSSE(() => '/combined?from=' + coIdx, es => {
-      // Typed events: stdout (default color) and stderr (red)
-      es.addEventListener('stdout', e => {
-        coIdx++;
-        writeTerm(combinedTerm, decode(e.data));
+    connectSSE(() => '/combined?from=' + combinedOffset, source => {
+      source.addEventListener('stdout', e => {
+        combinedOffset++;
+        writeToTerminal(panels.combined.terminal, decodeBase64(e.data));
       });
-      es.addEventListener('stderr', e => {
-        coIdx++;
-        writeTerm(combinedTerm, '\\x1b[31m' + decode(e.data) + '\\x1b[0m');
+      source.addEventListener('stderr', e => {
+        combinedOffset++;
+        writeToTerminal(panels.combined.terminal, '\\x1b[31m' + decodeBase64(e.data) + '\\x1b[0m');
       });
-      // Default message type: process exit notification
-      es.onmessage = e => writeTerm(combinedTerm, decode(e.data));
+      source.onmessage = e => writeToTerminal(panels.combined.terminal, decodeBase64(e.data));
     });
   </script>
 </body>
