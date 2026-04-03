@@ -160,12 +160,12 @@ Before making remote access richer, lock down control surfaces.
 **Why:** `/kill` and `/stdin` should not be publicly writable if remote access is enabled.
 
 **Tasks**
-- Add optional session token in query/header/cookie
-- Require token for control endpoints
-- Support read-only mode for viewers
+- [x] Add optional session token in query/header/cookie
+- [x] Require token for control endpoints
+- [x] Support read-only mode for viewers
 
 **Done when**
-- Remote viewers cannot control processes without authorization
+- [x] Remote viewers cannot control processes without authorization
 
 ### 2.3 Separate viewer and controller permissions
 **Priority:** Medium  

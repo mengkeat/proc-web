@@ -2,12 +2,13 @@ import { spawn } from "bun";
 
 // --- CLI argument parsing ---
 
-function parseArgs(argv: string[]): { port: number; host: string; maxHistory: number; logDir: string | null; command: string[] } {
+function parseArgs(argv: string[]): { port: number; host: string; maxHistory: number; logDir: string | null; token: string | null; command: string[] } {
   const args = argv.slice(2);
   let port = 3000;
   let host = "127.0.0.1";
   let maxHistory = 10000; // max chunks to keep in memory
   let logDir: string | null = null;
+  let token: string | null = null;
   const command: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -37,21 +38,27 @@ function parseArgs(argv: string[]): { port: number; host: string; maxHistory: nu
         console.error("Missing log-dir path");
         process.exit(1);
       }
+    } else if (args[i] === "--token") {
+      token = args[++i];
+      if (!token) {
+        console.error("Missing token value");
+        process.exit(1);
+      }
     } else {
       command.push(args[i]);
     }
   }
 
   if (command.length === 0) {
-    console.error("Usage: bun run server.ts [--port N] [--host ADDR] [--max-history N] [--log-dir DIR] <command> [args...]");
+    console.error("Usage: bun run server.ts [--port N] [--host ADDR] [--token TOKEN] [--max-history N] [--log-dir DIR] <command> [args...]");
     console.error("Example: bun run server.ts ls -la");
     process.exit(1);
   }
 
-  return { port, host, maxHistory, logDir, command };
+  return { port, host, maxHistory, logDir, token, command };
 }
 
-const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, command } = parseArgs(Bun.argv);
+const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, token: AUTH_TOKEN, command } = parseArgs(Bun.argv);
 
 // --- Disk-backed log persistence ---
 
@@ -264,6 +271,16 @@ function parseReplayOffset(req: Request, url: URL): number {
 
 const exitMessage = () => `\r\n[Process exited with code ${processExitCode}]\r\n`;
 
+function checkAuth(req: Request, url: URL): boolean {
+  if (!AUTH_TOKEN) return true;
+  const bearer = req.headers.get("Authorization")?.replace("Bearer ", "");
+  if (bearer === AUTH_TOKEN) return true;
+  if (url.searchParams.get("token") === AUTH_TOKEN) return true;
+  return false;
+}
+
+const UNAUTHORIZED = () => new Response("Unauthorized", { status: 401 });
+
 const server = Bun.serve({
   port: PORT,
   hostname: HOST,
@@ -281,11 +298,13 @@ const server = Bun.serve({
     }
 
     if (pathname === "/kill" && req.method === "POST") {
+      if (!checkAuth(req, url)) return UNAUTHORIZED();
       if (proc && !processExited) proc.kill();
       return Response.json({ ok: true });
     }
 
     if (pathname === "/stdin" && req.method === "POST") {
+      if (!checkAuth(req, url)) return UNAUTHORIZED();
       if (proc && !processExited) {
         const text = await req.text();
         try { proc.stdin.write(text + "\n"); await proc.stdin.flush(); } catch { /* closed */ }
@@ -651,6 +670,9 @@ const HTML = `<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.js"></script>
   <script>
+    const AUTH_TOKEN = ${AUTH_TOKEN ? `'${AUTH_TOKEN}'` : 'null'};
+    function authHeaders() { return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}; }
+
     const TERMINAL_OPTIONS = {
       fontSize: 14,
       fontFamily: 'Monaco, Menlo, "Courier New", monospace',
@@ -737,7 +759,7 @@ const HTML = `<!DOCTYPE html>
 
     // --- Kill ---
     function killProcess() {
-      fetch('/kill', { method: 'POST' }).catch(() => {});
+      fetch('/kill', { method: 'POST', headers: authHeaders() }).catch(() => {});
     }
 
     // --- Stdin ---
@@ -745,7 +767,7 @@ const HTML = `<!DOCTYPE html>
       const inp = document.getElementById('stdin-input');
       const text = inp.value;
       if (!text) return;
-      fetch('/stdin', { method: 'POST', body: text }).catch(() => {});
+      fetch('/stdin', { method: 'POST', body: text, headers: authHeaders() }).catch(() => {});
       inp.value = '';
     }
     document.getElementById('stdin-input').addEventListener('keydown', e => {
