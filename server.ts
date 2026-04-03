@@ -409,22 +409,56 @@ if (!spawnError) {
   broadcastToClients(combinedClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
 }
 
+let shutdownTimer: Timer | null = null;
+let hasShutdown = false;
+
+function shutdown(reason: string) {
+  if (hasShutdown) return;
+  hasShutdown = true;
+  console.log(`\n${reason}`);
+  stopHeartbeat();
+  if (proc && !processExited) {
+    try { proc.kill(); } catch { /* already dead */ }
+  }
+  server.stop();
+}
+
+function cancelPendingShutdown() {
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
+}
+
 function shutdownIfIdle() {
-  if (!processExited || activeConnectionCount > 0) return;
-  setTimeout(() => {
+  if (!processExited || activeConnectionCount > 0) {
+    cancelPendingShutdown();
+    return;
+  }
+  if (shutdownTimer) return;
+  shutdownTimer = setTimeout(() => {
     if (activeConnectionCount === 0) {
-      console.log("\nAll clients disconnected, shutting down...");
-      server.stop();
+      shutdown("All clients disconnected, shutting down...");
     }
   }, 5000);
 }
 
 setTimeout(() => {
   if (activeConnectionCount === 0) {
-    console.log("\nNo clients connected, shutting down...");
-    server.stop();
+    shutdown("No clients connected, shutting down...");
   }
 }, 60000);
+
+// Forward signals to child process and clean up
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    if (proc && !processExited) {
+      try { proc.kill(); } catch { /* already dead */ }
+    }
+    shutdown(`Received ${sig}, shutting down...`);
+    process.exit(0);
+  });
+}
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">

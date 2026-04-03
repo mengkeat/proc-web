@@ -129,13 +129,13 @@ These changes protect the app under long-running and high-volume workloads.
 **Why:** Child and server cleanup should be deterministic.
 
 **Tasks**
-- Track and cancel pending shutdown timers when clients reconnect
-- Forward server SIGINT/SIGTERM to child process
-- Prevent orphan processes on server exit
-- Ensure shutdown logic runs once
+- [x] Track and cancel pending shutdown timers when clients reconnect
+- [x] Forward server SIGINT/SIGTERM to child process
+- [x] Prevent orphan processes on server exit
+- [x] Ensure shutdown logic runs once
 
 **Done when**
-- Server and child process exit cleanly in normal and interrupted flows
+- [x] Server and child process exit cleanly in normal and interrupted flows
 
 ---
 
