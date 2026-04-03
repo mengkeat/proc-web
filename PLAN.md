@@ -77,13 +77,13 @@ These changes protect the app under long-running and high-volume workloads.
 **Why:** Current stdout/stderr/combined history arrays grow forever and can exhaust memory.
 
 **Tasks**
-- Introduce configurable retention limits by bytes and/or chunks
-- Keep only a recent replay window in memory
-- Track total buffered bytes
-- Clearly document retention behavior
+- [x] Introduce configurable retention limits by bytes and/or chunks
+- [x] Keep only a recent replay window in memory
+- [x] Track total buffered bytes
+- [x] Clearly document retention behavior
 
 **Done when**
-- Long-running commands no longer cause unbounded memory growth
+- [x] Long-running commands no longer cause unbounded memory growth
 
 ### 1.2 Add disk-backed log persistence
 **Priority:** Critical  

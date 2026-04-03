@@ -2,9 +2,10 @@ import { spawn } from "bun";
 
 // --- CLI argument parsing ---
 
-function parseArgs(argv: string[]): { port: number; command: string[] } {
+function parseArgs(argv: string[]): { port: number; maxHistory: number; command: string[] } {
   const args = argv.slice(2);
   let port = 3000;
+  let maxHistory = 10000; // max chunks to keep in memory
   const command: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -15,21 +16,28 @@ function parseArgs(argv: string[]): { port: number; command: string[] } {
         process.exit(1);
       }
       port = portValue;
+    } else if (args[i] === "--max-history") {
+      const val = parseInt(args[++i], 10);
+      if (isNaN(val) || val < 1) {
+        console.error("Invalid max-history value");
+        process.exit(1);
+      }
+      maxHistory = val;
     } else {
       command.push(args[i]);
     }
   }
 
   if (command.length === 0) {
-    console.error("Usage: bun run server.ts [--port N] <command> [args...]");
+    console.error("Usage: bun run server.ts [--port N] [--max-history N] <command> [args...]");
     console.error("Example: bun run server.ts ls -la");
     process.exit(1);
   }
 
-  return { port, command };
+  return { port, maxHistory, command };
 }
 
-const { port: PORT, command } = parseArgs(Bun.argv);
+const { port: PORT, maxHistory: MAX_HISTORY, command } = parseArgs(Bun.argv);
 
 // --- Startup info ---
 
@@ -64,10 +72,23 @@ const commandHtml = escapeHtml(command.join(" "));
 let processExited = false;
 let processExitCode: number | null = null;
 
-// Buffers for late-connecting / reconnecting clients
+// Bounded history buffers - old chunks are dropped when exceeding MAX_HISTORY
+// droppedCount tracks how many chunks were trimmed so ?from=N offsets stay valid
 const stdoutHistory: string[] = [];
+let stdoutDropped = 0;
 const stderrHistory: string[] = [];
+let stderrDropped = 0;
 const combinedHistory: { type: "stdout" | "stderr"; data: string }[] = [];
+let combinedDropped = 0;
+
+function trimHistory<T>(history: T[], dropped: number): number {
+  if (history.length > MAX_HISTORY) {
+    const excess = history.length - MAX_HISTORY;
+    history.splice(0, excess);
+    return dropped + excess;
+  }
+  return dropped;
+}
 
 // Active SSE client connections per stream
 const stdoutClients = new Set<ReadableStreamDefaultController>();
@@ -199,7 +220,8 @@ const server = Bun.serve({
     if (pathname === "/stdout") {
       const from = parseReplayOffset(url);
       return new Response(createSSEStream(stdoutClients, client => {
-        for (let i = from; i < stdoutHistory.length; i++) sendToClient(client, stdoutHistory[i]);
+        const idx = Math.max(0, from - stdoutDropped);
+        for (let i = idx; i < stdoutHistory.length; i++) sendToClient(client, stdoutHistory[i]);
         if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
@@ -207,7 +229,8 @@ const server = Bun.serve({
     if (pathname === "/stderr") {
       const from = parseReplayOffset(url);
       return new Response(createSSEStream(stderrClients, client => {
-        for (let i = from; i < stderrHistory.length; i++) sendToClient(client, stderrHistory[i]);
+        const idx = Math.max(0, from - stderrDropped);
+        for (let i = idx; i < stderrHistory.length; i++) sendToClient(client, stderrHistory[i]);
         if (processExited) sendToClient(client, exitMessage());
       }), { headers: SSE_HEADERS });
     }
@@ -215,7 +238,8 @@ const server = Bun.serve({
     if (pathname === "/combined") {
       const from = parseReplayOffset(url);
       return new Response(createSSEStream(combinedClients, client => {
-        for (let i = from; i < combinedHistory.length; i++) {
+        const idx = Math.max(0, from - combinedDropped);
+        for (let i = idx; i < combinedHistory.length; i++) {
           const { type, data } = combinedHistory[i];
           sendToClient(client, data, type);
         }
@@ -237,8 +261,10 @@ if (!spawnError) {
     write(chunk) {
       const data = stdoutDecoder.decode(chunk, { stream: true });
       stdoutHistory.push(data);
+      stdoutDropped = trimHistory(stdoutHistory, stdoutDropped);
       broadcastToClients(stdoutClients, data);
       combinedHistory.push({ type: "stdout", data });
+      combinedDropped = trimHistory(combinedHistory, combinedDropped);
       broadcastToClients(combinedClients, data, "stdout");
     },
     close() {
@@ -258,8 +284,10 @@ if (!spawnError) {
     write(chunk) {
       const data = stderrDecoder.decode(chunk, { stream: true });
       stderrHistory.push(data);
+      stderrDropped = trimHistory(stderrHistory, stderrDropped);
       broadcastToClients(stderrClients, data);
       combinedHistory.push({ type: "stderr", data });
+      combinedDropped = trimHistory(combinedHistory, combinedDropped);
       broadcastToClients(combinedClients, data, "stderr");
     },
     close() {
