@@ -22,49 +22,49 @@ Small, high-value changes with low implementation risk.
 **Why:** Current chunk decoding can corrupt multibyte characters if a UTF-8 sequence is split across chunks.
 
 **Tasks**
-- Use streaming `TextDecoder.decode(chunk, { stream: true })`
-- Flush decoders when stdout/stderr streams end
-- Add a test case or manual validation using Unicode-heavy output
+- [x] Use streaming `TextDecoder.decode(chunk, { stream: true })`
+- [x] Flush decoders when stdout/stderr streams end
+- [x] Add a test case or manual validation using Unicode-heavy output
 
 **Done when**
-- Non-ASCII output is rendered correctly under chunk boundaries
+- [x] Non-ASCII output is rendered correctly under chunk boundaries
 
 ### 0.2 Add SSE heartbeats
 **Priority:** High  
 **Why:** Idle SSE connections may be dropped by browsers, proxies, or network layers.
 
 **Tasks**
-- Send periodic SSE comment heartbeats such as `: ping\n\n`
-- Keep heartbeat interval configurable
-- Ensure heartbeats do not affect replay offsets
+- [x] Send periodic SSE comment heartbeats such as `: ping\n\n`
+- [x] Keep heartbeat interval configurable
+- [x] Ensure heartbeats do not affect replay offsets
 
 **Done when**
-- Quiet commands stay connected reliably over long idle periods
+- [x] Quiet commands stay connected reliably over long idle periods
 
 ### 0.3 Improve process / pipe error handling
 **Priority:** High  
 **Why:** Startup failures and stream failures should produce clear status for the browser and logs.
 
 **Tasks**
-- Wrap process startup in explicit error handling
-- Add `.catch()` handling to `pipeTo(...)`
-- Distinguish spawn failure from non-zero exit
-- Surface failures in UI status and logs
+- [x] Wrap process startup in explicit error handling
+- [x] Add `.catch()` handling to `pipeTo(...)`
+- [x] Distinguish spawn failure from non-zero exit
+- [x] Surface failures in UI status and logs
 
 **Done when**
-- Broken commands fail cleanly with a clear message instead of silent failure
+- [x] Broken commands fail cleanly with a clear message instead of silent failure
 
 ### 0.4 Make network IP detection robust
 **Priority:** Medium  
 **Why:** Current interface-name detection is brittle.
 
 **Tasks**
-- Iterate all network interfaces
-- Show non-internal IPv4 addresses
-- Prefer localhost by default in startup output
+- [x] Iterate all network interfaces
+- [x] Show non-internal IPv4 addresses
+- [x] Prefer localhost by default in startup output
 
 **Done when**
-- Startup output works across more Linux/WSL/network setups
+- [x] Startup output works across more Linux/WSL/network setups
 
 ---
 

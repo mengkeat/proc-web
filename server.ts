@@ -33,20 +33,26 @@ const { port: PORT, command } = parseArgs(Bun.argv);
 
 // --- Startup info ---
 
-function getLocalNetworkIP(): string | null {
+function getLocalNetworkIPs(): string[] {
   const os = require("os") as typeof import("os");
   const interfaces = os.networkInterfaces();
-  for (const name of ["eth0", "ens3", "enp0s3"]) {
-    const address = interfaces[name]?.[0]?.address;
-    if (address) return address;
+  const ips: string[] = [];
+  for (const entries of Object.values(interfaces)) {
+    if (!entries) continue;
+    for (const entry of entries) {
+      if (entry.family === "IPv4" && !entry.internal) {
+        ips.push(entry.address);
+      }
+    }
   }
-  return null;
+  return ips;
 }
 
 console.log(`Starting: ${command.join(" ")}`);
 console.log(`Open http://localhost:${PORT} in your browser`);
-const localIP = getLocalNetworkIP();
-if (localIP) console.log(`Open http://${localIP}:${PORT} in your Windows browser`);
+for (const ip of getLocalNetworkIPs()) {
+  console.log(`      http://${ip}:${PORT}`);
+}
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
