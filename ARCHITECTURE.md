@@ -70,32 +70,40 @@ const server = Bun.serve({
 
 ### Routes
 
-| Route | Description |
-|-------|-------------|
-| `/` | Main HTML page with embedded JS/CSS |
-| `/stdout` | SSE stream for stdout |
-| `/stderr` | SSE stream for stderr |
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/` | GET | Main HTML page with embedded JS/CSS |
+| `/stdout` | GET | SSE stream for stdout (supports `?from=N` for replay) |
+| `/stderr` | GET | SSE stream for stderr (supports `?from=N` for replay) |
+| `/combined` | GET | SSE stream for interleaved stdout+stderr (typed events) |
+| `/status` | GET | JSON `{running, exitCode}` process status |
+| `/kill` | POST | Kill the spawned process |
+| `/stdin` | POST | Write text to process stdin |
 
 ### SSE (Server-Sent Events)
 
-The server uses SSE to stream data to the browser:
+The server uses SSE to stream data to the browser. A shared `createSSEStream()` helper manages client registration, history replay via `?from=N`, and cleanup:
 
 ```typescript
-// Each client gets its own ReadableStream controller
-const stream = new ReadableStream({
-  start(controller) {
-    // Store controller for later use
-    stdoutController = controller;
-  },
-});
-
-return new Response(stream, {
-  headers: {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-  },
-});
+function createSSEStream(
+  clients: Set<ReadableStreamDefaultController>,
+  replayHistory: (client: ReadableStreamDefaultController) => void
+): ReadableStream {
+  activeConnectionCount++;
+  let thisClient!: ReadableStreamDefaultController;
+  return new ReadableStream({
+    start(controller) {
+      thisClient = controller;
+      clients.add(controller);
+      replayHistory(controller);
+    },
+    cancel() {
+      activeConnectionCount--;
+      clients.delete(thisClient);
+      shutdownIfIdle();
+    },
+  });
+}
 ```
 
 ### Data Flow
@@ -109,26 +117,33 @@ return new Response(stream, {
    });
    ```
 
-2. **Streaming stdout**
+2. **Streaming stdout** (stderr is identical)
    ```typescript
    proc.stdout.pipeTo(new WritableStream({
      write(chunk) {
-       const data = new TextDecoder().decode(chunk);
-       if (stdoutController) {
-         sendEvent(stdoutController, data);
-       } else {
-         stdoutBuffer.push(data);  // Buffer for late clients
-       }
+       const data = textDecoder.decode(chunk);
+       stdoutHistory.push(data);
+       broadcastToClients(stdoutClients, data);
+       combinedHistory.push({ type: "stdout", data });
+       broadcastToClients(combinedClients, data, "stdout");
      },
    }));
    ```
 
-3. **Encoding**
-   Data is base64-encoded to safely transmit ANSI escape sequences:
+3. **Encoding & Broadcasting**
+   Data is base64-encoded to safely transmit ANSI escape sequences, then broadcast to all connected clients:
    ```typescript
-   function sendEvent(controller, data) {
-     const encoded = btoa(unescape(encodeURIComponent(data)));
-     controller.enqueue(`data: ${encoded}\n\n`);
+   function encodeSSE(data: string, eventType?: string): Uint8Array {
+     const base64 = btoa(unescape(encodeURIComponent(data)));
+     const eventLine = eventType ? `event: ${eventType}\n` : "";
+     return textEncoder.encode(`${eventLine}data: ${base64}\n\n`);
+   }
+
+   function broadcastToClients(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string) {
+     const encoded = encodeSSE(data, eventType);
+     for (const client of clients) {
+       try { client.enqueue(encoded); } catch { clients.delete(client); }
+     }
    }
    ```
 
@@ -136,18 +151,19 @@ return new Response(stream, {
 
 If a browser connects after the command has already produced output, the server buffers the data:
 
-- `stdoutBuffer[]`: Array of buffered stdout chunks
-- `stderrBuffer[]`: Array of buffered stderr chunks
+- `stdoutHistory[]`: Array of buffered stdout chunks
+- `stderrHistory[]`: Array of buffered stderr chunks
+- `combinedHistory[]`: Array of `{ type, data }` entries for interleaved replay
 
-When a client connects, buffered data is sent immediately.
+When a client connects, buffered data is replayed from a given offset (`?from=N`), allowing reconnecting clients to resume without duplicates.
 
 ### Lifecycle
 
 1. Server starts, spawns command
 2. Client connects via browser
 3. Server streams data as it arrives
-4. When process exits, "[Process completed]" is sent
-5. Server shuts down after all clients disconnect (or 60s timeout)
+4. When process exits, "[Process exited with code N]" is sent to all streams
+5. Server shuts down after all clients disconnect (5s grace) or 60s with no connections
 
 ## Client Architecture
 
@@ -186,47 +202,52 @@ stdoutTerm.open(document.getElementById('stdout-terminal'));
 
 ### SSE Connection
 
-```javascript
-const stdoutEventSource = new EventSource('/stdout');
+Uses a `connectSSE()` helper with exponential backoff reconnection and offset-based replay:
 
-stdoutEventSource.onmessage = (event) => {
-  // Decode base64 back to string
-  const decoded = decodeURIComponent(escape(atob(event.data)));
-  stdoutTerm.write(decoded);  // Write to terminal
-};
+```javascript
+function connectSSE(buildUrl, onConnect) {
+  let retryDelay = 1000;
+  function connect() {
+    const source = new EventSource(buildUrl());
+    source.onopen = () => { retryDelay = 1000; };
+    onConnect(source);
+    source.onerror = () => {
+      source.close();
+      if (!processExited) {
+        setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 30000);
+      }
+    };
+  }
+  connect();
+}
+
+let stdoutOffset = 0;
+connectSSE(() => '/stdout?from=' + stdoutOffset, source => {
+  source.onmessage = e => { stdoutOffset++; writeToTerminal(panels.stdout.terminal, decodeBase64(e.data)); };
+});
 ```
+
+### Search
+
+Uses xterm.js `SearchAddon`. Toggle with 🔍 button or Ctrl+F. Supports find next/previous and Enter/Shift+Enter navigation.
 
 ## Key Design Decisions
 
 ### 1. Base64 Encoding
+ANSI escape sequences contain special characters that can break SSE framing. All data is base64-encoded on server, decoded on client.
 
-Why: ANSI escape sequences contain special characters that can break JSON or be misinterpreted.
+### 2. Multi-client Broadcasting
+Controllers are stored in `Set<ReadableStreamDefaultController>` sets per stream, allowing multiple browser tabs to view the same process.
 
-Solution: Encode as base64 on server, decode on client.
-
-### 2. TextDecoder for Binary Data
-
-Why: `chunk.toString()` on Uint8Array returns comma-separated numbers, not text.
-
-Solution: Use `new TextDecoder().decode(chunk)`.
-
-### 3. Global Controllers
-
-Why: SSE streams need to persist across requests.
-
-Solution: Store controllers in module-level variables (`stdoutController`, `stderrController`).
+### 3. Offset-based Replay
+Clients track their position in the server-side history arrays. On reconnect, `?from=N` resumes without duplicate data.
 
 ### 4. Binding to 0.0.0.0
+Bind to all interfaces so WSL processes are accessible from the Windows host browser.
 
-Why: `localhost` only accepts connections from the same machine.
-
-Solution: Bind to `0.0.0.0` to accept connections from Windows in WSL.
-
-### 5. ConvertEol Option
-
-Why: Terminals expect `\r\n` but many commands output just `\n`.
-
-Solution: xterm.js `convertEol: true` handles the conversion.
+### 5. ConvertEol
+xterm.js `convertEol: true` converts `\n` to `\r\n` since many commands output just `\n`.
 
 ## Files
 
@@ -242,5 +263,6 @@ Solution: xterm.js `convertEol: true` handles the conversion.
 - **Bun**: Server runtime
 - **xterm**: Terminal emulator
 - **xterm-addon-fit**: Auto-resize terminal to container
+- **xterm-addon-search**: Search within terminal buffer
 
 No database or external services required.
