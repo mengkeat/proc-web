@@ -351,6 +351,17 @@ const server = Bun.serve({
       return Response.json({ ok: true });
     }
 
+    if (pathname === "/resize" && req.method === "POST") {
+      if (!checkAuth(req, url)) return UNAUTHORIZED();
+      if (PTY_MODE && ptyProc && !processExited) {
+        const { cols, rows } = await req.json();
+        if (cols > 0 && rows > 0) {
+          try { ptyProc.resize(cols, rows); } catch { /* ignore */ }
+        }
+      }
+      return Response.json({ ok: true });
+    }
+
     if (pathname === "/stdout") {
       const from = parseReplayOffset(req, url);
       return new Response(createSSEStream(stdoutClients, client => {
@@ -746,8 +757,17 @@ const HTML = `<!DOCTYPE html>
       combined: createPanel('combined-terminal'),
     };
 
+    function sendResize() {
+      const term = panels[currentTab].terminal;
+      fetch('/resize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ cols: term.cols, rows: term.rows }),
+      }).catch(() => {});
+    }
     function fitActivePanel() {
       try { panels[currentTab].fitAddon.fit(); } catch (_) {}
+      sendResize();
     }
     fitActivePanel();
     window.addEventListener('resize', fitActivePanel);

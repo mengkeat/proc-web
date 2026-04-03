@@ -202,12 +202,12 @@ This phase closes the gap between “log viewer” and “real browser terminal�
 **Why:** PTY mode is incomplete without resize support.
 
 **Tasks**
-- Send rows/cols from browser to server
-- Resize the child PTY on terminal/container resize
-- Handle reconnect/resume with latest dimensions
+- [x] Send rows/cols from browser to server
+- [x] Resize the child PTY on terminal/container resize
+- [x] Handle reconnect/resume with latest dimensions
 
 **Done when**
-- Full-screen TUIs and wrapped output resize correctly
+- [x] Full-screen TUIs and wrapped output resize correctly
 
 ### 3.3 Improve stdin / signal controls
 **Priority:** Medium  
