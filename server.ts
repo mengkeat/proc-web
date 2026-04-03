@@ -70,6 +70,25 @@ const combinedClients = new Set<ReadableStreamDefaultController>();
 
 let activeConnectionCount = 0;
 const textEncoder = new TextEncoder();
+const HEARTBEAT_INTERVAL_MS = 15_000;
+let heartbeatTimer: Timer | null = null;
+
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    const ping = textEncoder.encode(": ping\n\n");
+    for (const client of stdoutClients) { try { client.enqueue(ping); } catch { stdoutClients.delete(client); } }
+    for (const client of stderrClients) { try { client.enqueue(ping); } catch { stderrClients.delete(client); } }
+    for (const client of combinedClients) { try { client.enqueue(ping); } catch { combinedClients.delete(client); } }
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
 
 // --- SSE helpers ---
 
@@ -96,6 +115,7 @@ function createSSEStream(
   replayHistory: (client: ReadableStreamDefaultController) => void
 ): ReadableStream {
   activeConnectionCount++;
+  if (activeConnectionCount === 1) startHeartbeat();
   let thisClient!: ReadableStreamDefaultController;
   return new ReadableStream({
     start(controller) {
@@ -106,6 +126,7 @@ function createSSEStream(
     cancel() {
       activeConnectionCount--;
       clients.delete(thisClient);
+      if (activeConnectionCount === 0) stopHeartbeat();
       shutdownIfIdle();
     },
   });
@@ -119,7 +140,18 @@ const SSE_HEADERS = {
 
 // --- Spawn the child process ---
 
-const proc = spawn({ cmd: command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+let spawnError: string | null = null;
+let proc: ReturnType<typeof spawn>;
+
+try {
+  proc = spawn({ cmd: command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+} catch (err) {
+  spawnError = err instanceof Error ? err.message : String(err);
+  console.error(`Failed to spawn process: ${spawnError}`);
+  processExited = true;
+  processExitCode = 127;
+  proc = null as any;
+}
 
 // --- HTTP server ---
 
@@ -142,16 +174,16 @@ const server = Bun.serve({
     }
 
     if (pathname === "/status") {
-      return Response.json({ running: !processExited, exitCode: processExitCode });
+      return Response.json({ running: !processExited, exitCode: processExitCode, spawnError });
     }
 
     if (pathname === "/kill" && req.method === "POST") {
-      if (!processExited) proc.kill();
+      if (proc && !processExited) proc.kill();
       return Response.json({ ok: true });
     }
 
     if (pathname === "/stdin" && req.method === "POST") {
-      if (!processExited) {
+      if (proc && !processExited) {
         const text = await req.text();
         try { proc.stdin.write(text + "\n"); await proc.stdin.flush(); } catch { /* closed */ }
       }
@@ -191,40 +223,78 @@ const server = Bun.serve({
 
 // --- Pipe process output to SSE clients ---
 
-const textDecoder = new TextDecoder();
+const stdoutDecoder = new TextDecoder();
+const stderrDecoder = new TextDecoder();
 
-proc.stdout.pipeTo(new WritableStream({
-  write(chunk) {
-    const data = textDecoder.decode(chunk);
-    stdoutHistory.push(data);
-    broadcastToClients(stdoutClients, data);
-    combinedHistory.push({ type: "stdout", data });
-    broadcastToClients(combinedClients, data, "stdout");
-  },
-}));
+if (!spawnError) {
+  proc.stdout.pipeTo(new WritableStream({
+    write(chunk) {
+      const data = stdoutDecoder.decode(chunk, { stream: true });
+      stdoutHistory.push(data);
+      broadcastToClients(stdoutClients, data);
+      combinedHistory.push({ type: "stdout", data });
+      broadcastToClients(combinedClients, data, "stdout");
+    },
+    close() {
+      const remaining = stdoutDecoder.decode();
+      if (remaining) {
+        stdoutHistory.push(remaining);
+        broadcastToClients(stdoutClients, remaining);
+        combinedHistory.push({ type: "stdout", data: remaining });
+        broadcastToClients(combinedClients, remaining, "stdout");
+      }
+    },
+  })).catch(err => {
+    console.error("stdout pipe error:", err.message);
+  });
 
-proc.stderr.pipeTo(new WritableStream({
-  write(chunk) {
-    const data = textDecoder.decode(chunk);
-    stderrHistory.push(data);
-    broadcastToClients(stderrClients, data);
-    combinedHistory.push({ type: "stderr", data });
-    broadcastToClients(combinedClients, data, "stderr");
-  },
-}));
+  proc.stderr.pipeTo(new WritableStream({
+    write(chunk) {
+      const data = stderrDecoder.decode(chunk, { stream: true });
+      stderrHistory.push(data);
+      broadcastToClients(stderrClients, data);
+      combinedHistory.push({ type: "stderr", data });
+      broadcastToClients(combinedClients, data, "stderr");
+    },
+    close() {
+      const remaining = stderrDecoder.decode();
+      if (remaining) {
+        stderrHistory.push(remaining);
+        broadcastToClients(stderrClients, remaining);
+        combinedHistory.push({ type: "stderr", data: remaining });
+        broadcastToClients(combinedClients, remaining, "stderr");
+      }
+    },
+  })).catch(err => {
+    console.error("stderr pipe error:", err.message);
+  });
 
-// --- Process lifecycle ---
+  // --- Process lifecycle ---
 
-proc.exited.then((code) => {
-  processExitCode = code;
-  processExited = true;
-  const message = exitMessage();
-  broadcastToClients(stdoutClients, message);
-  broadcastToClients(stderrClients, message);
-  broadcastToClients(combinedClients, message);
-  console.log(`\nProcess exited with code ${code}`);
-  shutdownIfIdle();
-});
+  proc.exited.then((code) => {
+    processExitCode = code;
+    processExited = true;
+    const message = exitMessage();
+    broadcastToClients(stdoutClients, message);
+    broadcastToClients(stderrClients, message);
+    broadcastToClients(combinedClients, message);
+    console.log(`\nProcess exited with code ${code}`);
+    shutdownIfIdle();
+  }).catch(err => {
+    console.error("Process exited with error:", err.message);
+    processExitCode = 1;
+    processExited = true;
+    const message = `\r\n[Process failed: ${err.message}]\r\n`;
+    broadcastToClients(stdoutClients, message);
+    broadcastToClients(stderrClients, message);
+    broadcastToClients(combinedClients, message);
+    shutdownIfIdle();
+  });
+} else {
+  broadcastToClients(stdoutClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
+  broadcastToClients(stderrClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
+  broadcastToClients(combinedClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
+}
 
 function shutdownIfIdle() {
   if (!processExited || activeConnectionCount > 0) return;
@@ -488,7 +558,14 @@ const HTML = `<!DOCTYPE html>
     function updateStatus() {
       fetch('/status').then(r => r.json()).then(s => {
         const el = document.getElementById('status-el');
-        if (s.running) {
+        if (s.spawnError) {
+          processExited = true;
+          el.textContent = '\\u25cf Spawn Error';
+          el.className = 'status-exited';
+          document.getElementById('kill-btn').style.display = 'none';
+          document.getElementById('stdin-area').style.display = 'none';
+          clearInterval(statusTimer);
+        } else if (s.running) {
           el.textContent = '\\u25cf Running';
           el.className = 'status-running';
         } else {
