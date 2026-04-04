@@ -258,12 +258,12 @@ These features make the tool feel complete for repeated use.
 **Why:** A common next action after failure or completion is rerunning the same command.
 
 **Tasks**
-- Add rerun button for completed sessions
-- Preserve command, cwd, and env configuration where applicable
-- Create a new session for each rerun
+- [x] Add rerun button for completed sessions
+- [x] Preserve command, cwd, and env configuration where applicable
+- [x] Create a new session for each rerun
 
 **Done when**
-- Repeated command workflows are one click away
+- [x] Repeated command workflows are one click away
 
 ### 4.4 Full log export
 **Priority:** Medium  

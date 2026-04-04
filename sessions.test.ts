@@ -233,4 +233,48 @@ describe("Phase 4.1: Introduce sessions", () => {
       cleanup();
     }
   });
+
+  test("POST /sessions/:id/rerun creates a new session with same command", async () => {
+    await startServer();
+    try {
+      // Get the initial session
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const originalId = sessions[0].id;
+      const originalCmd = sessions[0].command;
+
+      // Rerun the session
+      const rerunRes = await fetch(`${SERVER_URL}/sessions/${originalId}/rerun`, {
+        method: "POST",
+      });
+      expect(rerunRes.status).toBe(201);
+      const newSession = await rerunRes.json();
+      expect(newSession.id).toBeDefined();
+      expect(newSession.id).not.toBe(originalId);
+      expect(newSession.command).toEqual(originalCmd);
+
+      // Verify both sessions exist in the list
+      const listRes = await fetch(`${SERVER_URL}/api/sessions`);
+      const allSessions = await listRes.json();
+      expect(allSessions.length).toBeGreaterThanOrEqual(2);
+      expect(allSessions.find((s: any) => s.id === originalId)).toBeDefined();
+      expect(allSessions.find((s: any) => s.id === newSession.id)).toBeDefined();
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("POST /sessions/:id/rerun returns 404 for unknown session", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/sessions/nonexistent/rerun`, {
+        method: "POST",
+      });
+      expect(res.status).toBe(404);
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
 });

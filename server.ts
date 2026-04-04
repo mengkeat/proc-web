@@ -746,6 +746,19 @@ const server = Bun.serve({
       return Response.json({ ok: true });
     }
 
+    // Session rerun
+    const sessionRerunMatch = pathname.match(/^\/sessions\/([^\/]+)\/rerun$/);
+    if (sessionRerunMatch && req.method === "POST") {
+      if (!checkAuth(req, url)) return UNAUTHORIZED();
+      const sessionId = sessionRerunMatch[1];
+      const meta = sessionManager.getSessionMetadata(sessionId);
+      if (!meta) {
+        return Response.json({ error: "Session not found" }, { status: 404 });
+      }
+      const newSession = sessionManager.createSession(meta.command);
+      return Response.json(newSession.getMetadata(), { status: 201 });
+    }
+
     // Session stdin
     const sessionStdinMatch = pathname.match(/^\/sessions\/([^\/]+)\/stdin$/);
     if (sessionStdinMatch && req.method === "POST") {
@@ -822,12 +835,14 @@ function generateSessionListHTML(sessions: SessionMetadata[], authToken: string 
     const duration = s.durationMs ? `${(s.durationMs / 1000).toFixed(1)}s` : "—";
     const cmd = escapeHtml(s.command.join(" "));
     const shortId = s.id.slice(0, 8);
+    const actions = hasControl ? `<button class="btn" onclick="rerunSession('${s.id}')">Rerun</button>` : "";
     return `<tr>
       <td><a href="/sessions/${s.id}" class="session-link">${shortId}</a></td>
       <td class="cmd-cell" title="${cmd}">${cmd}</td>
       <td><span class="${statusClass}">${statusText}</span></td>
       <td>${startTime}</td>
       <td>${duration}</td>
+      ${hasControl ? `<td>${actions}</td>` : ""}
     </tr>`;
   }).join("");
 
@@ -935,10 +950,11 @@ function generateSessionListHTML(sessions: SessionMetadata[], authToken: string 
         <th>Status</th>
         <th>Started</th>
         <th>Duration</th>
+        ${hasControl ? `<th>Actions</th>` : ""}
       </tr>
     </thead>
     <tbody id="sessions-body">
-      ${rows || '<tr><td colspan="5" class="empty">No sessions yet</td></tr>'}
+      ${rows || `<tr><td colspan="${hasControl ? 6 : 5}" class="empty">No sessions yet</td></tr>`}
     </tbody>
   </table>
   <script>
@@ -974,8 +990,9 @@ function generateSessionListHTML(sessions: SessionMetadata[], authToken: string 
         .then(r => r.json())
         .then(sessions => {
           const tbody = document.getElementById('sessions-body');
+          const cols = ${hasControl} ? 6 : 5;
           if (sessions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" class="empty">No sessions yet</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="' + cols + '" class="empty">No sessions yet</td></tr>';
             return;
           }
           tbody.innerHTML = sessions.map(s => {
@@ -985,17 +1002,32 @@ function generateSessionListHTML(sessions: SessionMetadata[], authToken: string 
             const duration = s.durationMs ? (s.durationMs / 1000).toFixed(1) + 's' : '—';
             const cmd = s.command.join(' ');
             const shortId = s.id.slice(0, 8);
+            const actions = ${hasControl} ? '<td><button class="btn" onclick="rerunSession(\\'' + s.id + '\\')">Rerun</button></td>' : '';
             return '<tr>' +
               '<td><a href="/sessions/' + s.id + '" class="session-link">' + shortId + '</a></td>' +
               '<td class="cmd-cell" title="' + cmd + '">' + cmd + '</td>' +
               '<td><span class="' + statusClass + '">' + statusText + '</span></td>' +
               '<td>' + startTime + '</td>' +
               '<td>' + duration + '</td>' +
+              actions +
               '</tr>';
           }).join('');
         })
         .catch(() => {});
     }
+
+    function rerunSession(sessionId) {
+      fetch('/sessions/' + sessionId + '/rerun', {
+        method: 'POST',
+        headers: authHeaders(),
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.id) window.location.href = '/sessions/' + data.id;
+      })
+      .catch(() => {});
+    }
+
     setInterval(refreshSessions, 2000);
   </script>
 </body>
@@ -1054,6 +1086,18 @@ function generateCompletedSessionHTML(meta: SessionMetadata, authToken: string |
     .header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
     .status-running { color: #4ec9b0; }
     .status-exited { color: #f14c4c; }
+    .btn {
+      background: #3c3c3c;
+      color: #d4d4d4;
+      border: 1px solid #555;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn:hover { background: #4a4a4a; }
+    .btn-primary { background: #4ec9b0; color: #1e1e1e; border-color: #4ec9b0; font-weight: 600; }
+    .btn-primary:hover { background: #3db89e; }
     .details {
       background: #2d2d2d;
       padding: 16px;
@@ -1073,6 +1117,7 @@ function generateCompletedSessionHTML(meta: SessionMetadata, authToken: string |
     <span class="command" title="${commandHtml}">${commandHtml}</span>
     <div class="header-right">
       <span class="${statusClass}">${statusText}</span>
+      ${hasControl ? `<button class="btn btn-primary" onclick="rerunSession()">Rerun</button>` : ""}
     </div>
   </header>
 
@@ -1085,6 +1130,21 @@ function generateCompletedSessionHTML(meta: SessionMetadata, authToken: string |
     <div class="detail-row"><span class="detail-label">Exit Code:</span><span class="detail-value">${meta.exitCode ?? "—"}</span></div>
     ${meta.spawnError ? `<div class="detail-row"><span class="detail-label">Error:</span><span class="detail-value">${escapeHtml(meta.spawnError)}</span></div>` : ""}
   </div>
+  <script>
+    const AUTH_TOKEN = ${authToken ? `'${authToken}'` : "null"};
+    function authHeaders() { return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}; }
+    function rerunSession() {
+      fetch('/sessions/${meta.id}/rerun', {
+        method: 'POST',
+        headers: authHeaders(),
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.id) window.location.href = '/sessions/' + data.id;
+      })
+      .catch(() => {});
+    }
+  </script>
 </body>
 </html>`;
 }
