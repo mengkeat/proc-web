@@ -277,4 +277,117 @@ describe("Phase 4.1: Introduce sessions", () => {
       cleanup();
     }
   });
+
+  test("GET /sessions/:id/export/metadata returns session metadata", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const exportRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/export/metadata`);
+      expect(exportRes.status).toBe(200);
+      const meta = await exportRes.json();
+      expect(meta.id).toBe(sessionId);
+      expect(meta.command).toEqual(["echo", "test-output"]);
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("GET /sessions/:id/export/stdout returns stdout log", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const exportRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/export/stdout`);
+      expect(exportRes.status).toBe(200);
+      const content = await exportRes.text();
+      expect(content).toContain("test-output");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("GET /sessions/:id/export/stderr returns stderr log", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const exportRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/export/stderr`);
+      expect(exportRes.status).toBe(200);
+      // stderr might be empty, but should still return 200
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("GET /sessions/:id/export/combined returns combined log", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const exportRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/export/combined`);
+      expect(exportRes.status).toBe(200);
+      const content = await exportRes.text();
+      expect(content).toContain("test-output");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("export from completed session after restart reads from disk", async () => {
+    await startServer();
+    let sessionId: string;
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      sessionId = sessions[0].id;
+    } finally {
+      await stopServer();
+    }
+
+    await Bun.sleep(500);
+
+    // Restart server
+    serverProc = Bun.spawn(["bun", "run", "server.ts", "--port", String(TEST_PORT), "--log-dir", TEST_LOG_DIR, "echo", "second"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    for (let i = 0; i < 20; i++) {
+      try {
+        const res = await fetch(`${SERVER_URL}/api/sessions`);
+        if (res.ok) break;
+      } catch {}
+      await Bun.sleep(200);
+    }
+
+    try {
+      // Export stdout from old session (from disk)
+      const stdoutRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/export/stdout`);
+      expect(stdoutRes.status).toBe(200);
+      const content = await stdoutRes.text();
+      expect(content).toContain("test-output");
+
+      // Export metadata from old session (from disk)
+      const metaRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/export/metadata`);
+      expect(metaRes.status).toBe(200);
+      const meta = await metaRes.json();
+      expect(meta.id).toBe(sessionId);
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
 });

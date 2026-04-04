@@ -270,12 +270,12 @@ These features make the tool feel complete for repeated use.
 **Why:** Current download uses the terminal buffer only.
 
 **Tasks**
-- Export raw stdout, raw stderr, combined log, and metadata
-- Support downloading from persisted server-side history
-- Ensure exports are not limited by client scrollback
+- [x] Export raw stdout, raw stderr, combined log, and metadata
+- [x] Support downloading from persisted server-side history
+- [x] Ensure exports are not limited by client scrollback
 
 **Done when**
-- Users can reliably retrieve complete logs for large jobs
+- [x] Users can reliably retrieve complete logs for large jobs
 
 ---
 

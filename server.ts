@@ -759,6 +759,66 @@ const server = Bun.serve({
       return Response.json(newSession.getMetadata(), { status: 201 });
     }
 
+    // Session log export
+    const sessionExportMatch = pathname.match(/^\/sessions\/([^\/]+)\/export\/(stdout|stderr|combined|metadata)$/);
+    if (sessionExportMatch && req.method === "GET") {
+      const sessionId = sessionExportMatch[1];
+      const exportType = sessionExportMatch[2] as "stdout" | "stderr" | "combined" | "metadata";
+
+      // Try active session first
+      const session = sessionManager.getSession(sessionId);
+      if (session) {
+        if (exportType === "metadata") {
+          return Response.json(session.getMetadata(), {
+            headers: { "Content-Disposition": `attachment; filename="${sessionId}-metadata.json"` },
+          });
+        }
+        const history = exportType === "stdout" ? session.stdoutHistory :
+                        exportType === "stderr" ? session.stderrHistory :
+                        session.combinedHistory.map(e => e.data);
+        const content = history.join("");
+        return new Response(content, {
+          headers: {
+            "Content-Type": "text/plain",
+            "Content-Disposition": `attachment; filename="${sessionId}-${exportType}.log"`,
+          },
+        });
+      }
+
+      // Try completed session from disk
+      const meta = sessionManager.getSessionMetadata(sessionId);
+      if (!meta) {
+        return Response.json({ error: "Session not found" }, { status: 404 });
+      }
+      if (LOG_DIR) {
+        const logDir = join(LOG_DIR, sessionId);
+        if (exportType === "metadata") {
+          const metaPath = join(logDir, "metadata.json");
+          if (existsSync(metaPath)) {
+            const content = readFileSync(metaPath, "utf-8");
+            return new Response(content, {
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Disposition": `attachment; filename="${sessionId}-metadata.json"`,
+              },
+            });
+          }
+        } else {
+          const logFile = join(logDir, `${exportType}.log`);
+          if (existsSync(logFile)) {
+            const content = readFileSync(logFile, "utf-8");
+            return new Response(content, {
+              headers: {
+                "Content-Type": "text/plain",
+                "Content-Disposition": `attachment; filename="${sessionId}-${exportType}.log"`,
+              },
+            });
+          }
+        }
+      }
+      return Response.json({ error: "Log files not available for this session" }, { status: 404 });
+    }
+
     // Session stdin
     const sessionStdinMatch = pathname.match(/^\/sessions\/([^\/]+)\/stdin$/);
     if (sessionStdinMatch && req.method === "POST") {
@@ -1129,6 +1189,15 @@ function generateCompletedSessionHTML(meta: SessionMetadata, authToken: string |
     <div class="detail-row"><span class="detail-label">Duration:</span><span class="detail-value">${duration}</span></div>
     <div class="detail-row"><span class="detail-label">Exit Code:</span><span class="detail-value">${meta.exitCode ?? "—"}</span></div>
     ${meta.spawnError ? `<div class="detail-row"><span class="detail-label">Error:</span><span class="detail-value">${escapeHtml(meta.spawnError)}</span></div>` : ""}
+  </div>
+  <div class="details">
+    <h3>Downloads</h3>
+    <div style="display: flex; gap: 8px;">
+      <a class="btn" href="/sessions/${meta.id}/export/stdout" download>stdout.log</a>
+      <a class="btn" href="/sessions/${meta.id}/export/stderr" download>stderr.log</a>
+      <a class="btn" href="/sessions/${meta.id}/export/combined" download>combined.log</a>
+      <a class="btn" href="/sessions/${meta.id}/export/metadata" download>metadata.json</a>
+    </div>
   </div>
   <script>
     const AUTH_TOKEN = ${authToken ? `'${authToken}'` : "null"};
