@@ -1,4 +1,7 @@
 import { spawn } from "bun";
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync, readdirSync, existsSync, statSync } from "fs";
+import { join } from "path";
+import { randomUUID } from "crypto";
 
 // --- CLI argument parsing ---
 
@@ -6,7 +9,7 @@ function parseArgs(argv: string[]): { port: number; host: string; maxHistory: nu
   const args = argv.slice(2);
   let port = 3000;
   let host = "127.0.0.1";
-  let maxHistory = 10000; // max chunks to keep in memory
+  let maxHistory = 10000;
   let logDir: string | null = null;
   let token: string | null = null;
   let pty = false;
@@ -61,50 +64,499 @@ function parseArgs(argv: string[]): { port: number; host: string; maxHistory: nu
   return { port, host, maxHistory, logDir, token, pty, command };
 }
 
-const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, token: AUTH_TOKEN, pty: PTY_MODE, command } = parseArgs(Bun.argv);
+const { port: PORT, host: HOST, maxHistory: MAX_HISTORY, logDir: LOG_DIR, token: AUTH_TOKEN, pty: PTY_MODE, command: INITIAL_COMMAND } = parseArgs(Bun.argv);
 
-// --- Disk-backed log persistence ---
+// --- Types ---
 
-import { mkdirSync, appendFileSync, writeFileSync } from "fs";
-import { join } from "path";
-
-let logSessionDir: string | null = null;
-let stdoutLogPath: string | null = null;
-let stderrLogPath: string | null = null;
-let combinedLogPath: string | null = null;
-let metadataPath: string | null = null;
-const startTime = Date.now();
-
-if (LOG_DIR) {
-  const sessionId = new Date().toISOString().replace(/[:.]/g, "-");
-  logSessionDir = join(LOG_DIR, sessionId);
-  mkdirSync(logSessionDir, { recursive: true });
-  stdoutLogPath = join(logSessionDir, "stdout.log");
-  stderrLogPath = join(logSessionDir, "stderr.log");
-  combinedLogPath = join(logSessionDir, "combined.log");
-  metadataPath = join(logSessionDir, "metadata.json");
-  writeFileSync(metadataPath, JSON.stringify({
-    command,
-    startTime: new Date(startTime).toISOString(),
-    pid: process.pid,
-  }, null, 2));
+interface SessionMetadata {
+  id: string;
+  command: string[];
+  startTime: number;
+  endTime: number | null;
+  durationMs: number | null;
+  exitCode: number | null;
+  spawnError: string | null;
+  processExited: boolean;
+  pty: boolean;
 }
 
-function appendLog(path: string | null, data: string) {
-  if (path) try { appendFileSync(path, data); } catch { /* ignore */ }
-}
+// --- Session class ---
 
-function updateMetadata(exitCode: number) {
-  if (metadataPath) {
-    try {
-      writeFileSync(metadataPath, JSON.stringify({
+class Session {
+  id: string;
+  command: string[];
+  startTime: number;
+  endTime: number | null;
+  exitCode: number | null;
+  spawnError: string | null;
+  processExited: boolean;
+  pty: boolean;
+
+  stdoutHistory: string[];
+  stdoutDropped: number;
+  stderrHistory: string[];
+  stderrDropped: number;
+  combinedHistory: { type: "stdout" | "stderr"; data: string }[];
+  combinedDropped: number;
+
+  stdoutClients: Set<ReadableStreamDefaultController>;
+  stderrClients: Set<ReadableStreamDefaultController>;
+  combinedClients: Set<ReadableStreamDefaultController>;
+  activeConnectionCount: number;
+  heartbeatTimer: Timer | null;
+
+  proc: ReturnType<typeof spawn> | null;
+  ptyProc: any;
+
+  logSessionDir: string | null;
+  stdoutLogPath: string | null;
+  stderrLogPath: string | null;
+  combinedLogPath: string | null;
+  metadataPath: string | null;
+
+  private maxHistory: number;
+  private textEncoder: TextEncoder;
+  private onStateChange: () => void;
+
+  constructor(command: string[], pty: boolean, logDir: string | null, maxHistory: number, onStateChange: () => void) {
+    this.id = randomUUID();
+    this.command = command;
+    this.startTime = Date.now();
+    this.endTime = null;
+    this.exitCode = null;
+    this.spawnError = null;
+    this.processExited = false;
+    this.pty = pty;
+
+    this.stdoutHistory = [];
+    this.stdoutDropped = 0;
+    this.stderrHistory = [];
+    this.stderrDropped = 0;
+    this.combinedHistory = [];
+    this.combinedDropped = 0;
+
+    this.stdoutClients = new Set();
+    this.stderrClients = new Set();
+    this.combinedClients = new Set();
+    this.activeConnectionCount = 0;
+    this.heartbeatTimer = null;
+
+    this.proc = null;
+    this.ptyProc = null;
+
+    this.logSessionDir = null;
+    this.stdoutLogPath = null;
+    this.stderrLogPath = null;
+    this.combinedLogPath = null;
+    this.metadataPath = null;
+
+    this.maxHistory = maxHistory;
+    this.textEncoder = new TextEncoder();
+    this.onStateChange = onStateChange;
+
+    if (logDir) {
+      this.logSessionDir = join(logDir, this.id);
+      mkdirSync(this.logSessionDir, { recursive: true });
+      this.stdoutLogPath = join(this.logSessionDir, "stdout.log");
+      this.stderrLogPath = join(this.logSessionDir, "stderr.log");
+      this.combinedLogPath = join(this.logSessionDir, "combined.log");
+      this.metadataPath = join(this.logSessionDir, "metadata.json");
+      writeFileSync(this.metadataPath, JSON.stringify({
+        id: this.id,
         command,
-        startTime: new Date(startTime).toISOString(),
-        endTime: new Date().toISOString(),
-        durationMs: Date.now() - startTime,
-        exitCode,
+        startTime: new Date(this.startTime).toISOString(),
         pid: process.pid,
       }, null, 2));
+    }
+
+    this.spawnProcess();
+  }
+
+  getMetadata(): SessionMetadata {
+    return {
+      id: this.id,
+      command: this.command,
+      startTime: this.startTime,
+      endTime: this.endTime,
+      durationMs: this.endTime ? this.endTime - this.startTime : null,
+      exitCode: this.exitCode,
+      spawnError: this.spawnError,
+      processExited: this.processExited,
+      pty: this.pty,
+    };
+  }
+
+  private appendLog(path: string | null, data: string) {
+    if (path) try { appendFileSync(path, data); } catch { /* ignore */ }
+  }
+
+  private updateMetadata() {
+    if (this.metadataPath) {
+      try {
+        writeFileSync(this.metadataPath, JSON.stringify({
+          id: this.id,
+          command: this.command,
+          startTime: new Date(this.startTime).toISOString(),
+          endTime: this.endTime ? new Date(this.endTime).toISOString() : null,
+          durationMs: this.endTime ? this.endTime - this.startTime : null,
+          exitCode: this.exitCode,
+          pid: process.pid,
+        }, null, 2));
+      } catch { /* ignore */ }
+    }
+  }
+
+  private trimHistory<T>(history: T[], dropped: number): number {
+    if (history.length > this.maxHistory) {
+      const excess = history.length - this.maxHistory;
+      history.splice(0, excess);
+      return dropped + excess;
+    }
+    return dropped;
+  }
+
+  private startHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      const ping = this.textEncoder.encode(": ping\n\n");
+      for (const client of this.stdoutClients) { try { client.enqueue(ping); } catch { this.dropClient(client, this.stdoutClients); } }
+      for (const client of this.stderrClients) { try { client.enqueue(ping); } catch { this.dropClient(client, this.stderrClients); } }
+      for (const client of this.combinedClients) { try { client.enqueue(ping); } catch { this.dropClient(client, this.combinedClients); } }
+    }, 15_000);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private encodeSSE(data: string, eventType?: string, id?: number): Uint8Array {
+    const base64 = btoa(unescape(encodeURIComponent(data)));
+    const idLine = id !== undefined ? `id: ${id}\n` : "";
+    const eventLine = eventType ? `event: ${eventType}\n` : "";
+    return this.textEncoder.encode(`${idLine}${eventLine}data: ${base64}\n\n`);
+  }
+
+  private sendToClient(client: ReadableStreamDefaultController, data: string, eventType?: string, id?: number) {
+    try { client.enqueue(this.encodeSSE(data, eventType, id)); } catch { /* disconnected */ }
+  }
+
+  private dropClient(client: ReadableStreamDefaultController, clients: Set<ReadableStreamDefaultController>) {
+    if (clients.delete(client)) {
+      this.activeConnectionCount--;
+      try { client.close(); } catch { /* already closed */ }
+      if (this.activeConnectionCount === 0) this.stopHeartbeat();
+    }
+  }
+
+  private broadcast(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string, id?: number) {
+    if (!clients.size) return;
+    const encoded = this.encodeSSE(data, eventType, id);
+    for (const client of clients) {
+      try {
+        client.enqueue(encoded);
+      } catch {
+        this.dropClient(client, clients);
+      }
+    }
+  }
+
+  createSSEStream(
+    clients: Set<ReadableStreamDefaultController>,
+    replayHistory: (client: ReadableStreamDefaultController) => void
+  ): ReadableStream {
+    this.activeConnectionCount++;
+    if (this.activeConnectionCount === 1) this.startHeartbeat();
+    let thisClient!: ReadableStreamDefaultController;
+    return new ReadableStream({
+      start(controller) {
+        thisClient = controller;
+        clients.add(controller);
+        replayHistory(controller);
+      },
+      cancel: () => {
+        this.activeConnectionCount--;
+        clients.delete(thisClient);
+        if (this.activeConnectionCount === 0) this.stopHeartbeat();
+      },
+    });
+  }
+
+  private exitMessage(): string {
+    return `\r\n[Process exited with code ${this.exitCode}]\r\n`;
+  }
+
+  private handleStdoutData(data: string) {
+    this.stdoutHistory.push(data);
+    this.stdoutDropped = this.trimHistory(this.stdoutHistory, this.stdoutDropped);
+    const stdoutEventId = this.stdoutDropped + this.stdoutHistory.length - 1;
+    this.broadcast(this.stdoutClients, data, undefined, stdoutEventId);
+    this.combinedHistory.push({ type: "stdout", data });
+    this.combinedDropped = this.trimHistory(this.combinedHistory, this.combinedDropped);
+    const combinedEventId = this.combinedDropped + this.combinedHistory.length - 1;
+    this.broadcast(this.combinedClients, data, "stdout", combinedEventId);
+    this.appendLog(this.stdoutLogPath, data);
+    this.appendLog(this.combinedLogPath, data);
+  }
+
+  private handleStderrData(data: string) {
+    this.stderrHistory.push(data);
+    this.stderrDropped = this.trimHistory(this.stderrHistory, this.stderrDropped);
+    const stderrEventId = this.stderrDropped + this.stderrHistory.length - 1;
+    this.broadcast(this.stderrClients, data, undefined, stderrEventId);
+    this.combinedHistory.push({ type: "stderr", data });
+    this.combinedDropped = this.trimHistory(this.combinedHistory, this.combinedDropped);
+    const combinedEventId = this.combinedDropped + this.combinedHistory.length - 1;
+    this.broadcast(this.combinedClients, data, "stderr", combinedEventId);
+    this.appendLog(this.stderrLogPath, data);
+    this.appendLog(this.combinedLogPath, data);
+  }
+
+  private handleProcessExit(code: number) {
+    this.exitCode = code;
+    this.processExited = true;
+    this.endTime = Date.now();
+    const message = this.exitMessage();
+    this.broadcast(this.stdoutClients, message);
+    this.broadcast(this.stderrClients, message);
+    this.broadcast(this.combinedClients, message);
+    console.log(`\n[${this.id.slice(0, 8)}] Process exited with code ${code}`);
+    this.updateMetadata();
+    this.onStateChange();
+  }
+
+  private spawnProcess() {
+    if (this.pty) {
+      try {
+        const nodePty = require("node-pty");
+        this.ptyProc = nodePty.spawn(this.command[0], this.command.slice(1), {
+          name: "xterm-256color",
+          cols: 80,
+          rows: 24,
+          cwd: process.cwd(),
+          env: process.env,
+        });
+      } catch (err) {
+        this.spawnError = err instanceof Error ? err.message : String(err);
+        console.error(`[${this.id.slice(0, 8)}] Failed to spawn PTY process: ${this.spawnError}`);
+        this.processExited = true;
+        this.exitCode = 127;
+        this.endTime = Date.now();
+        this.updateMetadata();
+        this.onStateChange();
+        this.broadcast(this.stdoutClients, `\r\n[Failed to start PTY process: ${this.spawnError}]\r\n`);
+        this.broadcast(this.stderrClients, `\r\n[Failed to start PTY process: ${this.spawnError}]\r\n`);
+        this.broadcast(this.combinedClients, `\r\n[Failed to start PTY process: ${this.spawnError}]\r\n`);
+        return;
+      }
+    } else {
+      try {
+        this.proc = spawn({ cmd: this.command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+      } catch (err) {
+        this.spawnError = err instanceof Error ? err.message : String(err);
+        console.error(`[${this.id.slice(0, 8)}] Failed to spawn process: ${this.spawnError}`);
+        this.processExited = true;
+        this.exitCode = 127;
+        this.endTime = Date.now();
+        this.updateMetadata();
+        this.onStateChange();
+        this.broadcast(this.stdoutClients, `\r\n[Failed to start process: ${this.spawnError}]\r\n`);
+        this.broadcast(this.stderrClients, `\r\n[Failed to start process: ${this.spawnError}]\r\n`);
+        this.broadcast(this.combinedClients, `\r\n[Failed to start process: ${this.spawnError}]\r\n`);
+        return;
+      }
+    }
+
+    if (this.pty && this.ptyProc) {
+      this.ptyProc.onData((data: string) => {
+        this.handleStdoutData(data);
+      });
+      this.ptyProc.onExit(({ exitCode }: { exitCode: number }) => {
+        this.handleProcessExit(exitCode);
+      });
+    } else if (this.proc) {
+      const stdoutDecoder = new TextDecoder();
+      const stderrDecoder = new TextDecoder();
+
+      this.proc.stdout.pipeTo(new WritableStream({
+        write: (chunk) => {
+          this.handleStdoutData(stdoutDecoder.decode(chunk, { stream: true }));
+        },
+        close: () => {
+          const remaining = stdoutDecoder.decode();
+          if (remaining) this.handleStdoutData(remaining);
+        },
+      })).catch(err => {
+        console.error(`[${this.id.slice(0, 8)}] stdout pipe error:`, err.message);
+      });
+
+      this.proc.stderr.pipeTo(new WritableStream({
+        write: (chunk) => {
+          this.handleStderrData(stderrDecoder.decode(chunk, { stream: true }));
+        },
+        close: () => {
+          const remaining = stderrDecoder.decode();
+          if (remaining) this.handleStderrData(remaining);
+        },
+      })).catch(err => {
+        console.error(`[${this.id.slice(0, 8)}] stderr pipe error:`, err.message);
+      });
+
+      this.proc.exited.then((code) => {
+        this.handleProcessExit(code);
+      }).catch(err => {
+        console.error(`[${this.id.slice(0, 8)}] Process exited with error:`, err.message);
+        this.exitCode = 1;
+        this.processExited = true;
+        this.endTime = Date.now();
+        const message = `\r\n[Process failed: ${err.message}]\r\n`;
+        this.broadcast(this.stdoutClients, message);
+        this.broadcast(this.stderrClients, message);
+        this.broadcast(this.combinedClients, message);
+        this.updateMetadata();
+        this.onStateChange();
+      });
+    }
+  }
+
+  writeStdin(text: string, raw = false) {
+    const data = raw ? text : text + "\n";
+    if (this.pty && this.ptyProc) {
+      this.ptyProc.write(data);
+    } else if (this.proc) {
+      try { this.proc.stdin.write(data); this.proc.stdin.flush(); } catch { /* closed */ }
+    }
+  }
+
+  kill() {
+    if (this.pty && this.ptyProc) {
+      this.ptyProc.kill();
+    } else if (this.proc) {
+      this.proc.kill();
+    }
+  }
+
+  sendSignal(signal: string) {
+    if (this.processExited) return;
+    const sigMap: Record<string, number> = { SIGINT: 2, SIGTERM: 15, SIGKILL: 9 };
+    const sigNum = sigMap[signal];
+    if (sigNum !== undefined) {
+      if (this.pty && this.ptyProc) {
+        try { this.ptyProc.kill(sigNum); } catch { /* ignore */ }
+      } else if (this.proc) {
+        try { this.proc.kill(sigNum); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  resize(cols: number, rows: number) {
+    if (this.pty && this.ptyProc && !this.processExited) {
+      if (cols > 0 && rows > 0) {
+        try { this.ptyProc.resize(cols, rows); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  getStatus() {
+    return {
+      running: !this.processExited,
+      exitCode: this.exitCode,
+      spawnError: this.spawnError,
+    };
+  }
+
+  cleanup() {
+    this.stopHeartbeat();
+    if (!this.processExited) {
+      try { this.kill(); } catch { /* already dead */ }
+    }
+  }
+}
+
+// --- Session manager ---
+
+class SessionManager {
+  sessions: Map<string, Session>;
+  completedMeta: Map<string, SessionMetadata>;
+  private logDir: string | null;
+  private maxHistory: number;
+  private pty: boolean;
+  private onStateChange: () => void;
+
+  constructor(logDir: string | null, maxHistory: number, pty: boolean, onStateChange: () => void) {
+    this.sessions = new Map();
+    this.completedMeta = new Map();
+    this.logDir = logDir;
+    this.maxHistory = maxHistory;
+    this.pty = pty;
+    this.onStateChange = onStateChange;
+  }
+
+  createSession(command: string[]): Session {
+    const session = new Session(command, this.pty, this.logDir, this.maxHistory, () => {
+      this.onSessionComplete(session);
+    });
+    this.sessions.set(session.id, session);
+    console.log(`[${session.id.slice(0, 8)}] New session: ${command.join(" ")}`);
+    this.onStateChange();
+    return session;
+  }
+
+  getSession(id: string): Session | undefined {
+    return this.sessions.get(id);
+  }
+
+  getSessionMetadata(id: string): SessionMetadata | null {
+    const session = this.sessions.get(id);
+    if (session) return session.getMetadata();
+    const meta = this.completedMeta.get(id);
+    return meta ?? null;
+  }
+
+  listSessions(): SessionMetadata[] {
+    const results: SessionMetadata[] = [];
+    for (const session of this.sessions.values()) {
+      results.push(session.getMetadata());
+    }
+    for (const meta of this.completedMeta.values()) {
+      if (!this.sessions.has(meta.id)) {
+        results.push(meta);
+      }
+    }
+    return results;
+  }
+
+  private onSessionComplete(session: Session) {
+    this.completedMeta.set(session.id, session.getMetadata());
+    this.onStateChange();
+  }
+
+  loadCompletedSessions() {
+    if (!this.logDir || !existsSync(this.logDir)) return;
+    try {
+      const entries = readdirSync(this.logDir);
+      for (const entry of entries) {
+        const metaPath = join(this.logDir, entry, "metadata.json");
+        if (existsSync(metaPath)) {
+          try {
+            const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+            const sessionMeta: SessionMetadata = {
+              id: meta.id || entry,
+              command: meta.command || [],
+              startTime: meta.startTime ? new Date(meta.startTime).getTime() : 0,
+              endTime: meta.endTime ? new Date(meta.endTime).getTime() : null,
+              durationMs: meta.durationMs || null,
+              exitCode: meta.exitCode ?? null,
+              spawnError: meta.spawnError || null,
+              processExited: true,
+              pty: meta.pty || false,
+            };
+            this.completedMeta.set(sessionMeta.id, sessionMeta);
+          } catch { /* skip malformed */ }
+        }
+      }
     } catch { /* ignore */ }
   }
 }
@@ -126,7 +578,7 @@ function getLocalNetworkIPs(): string[] {
   return ips;
 }
 
-console.log(`Starting: ${command.join(" ")}`);
+console.log(`Starting: ${INITIAL_COMMAND.join(" ")}`);
 console.log(`Open http://localhost:${PORT} in your browser`);
 for (const ip of getLocalNetworkIPs()) {
   console.log(`      http://${ip}:${PORT}`);
@@ -135,179 +587,24 @@ for (const ip of getLocalNetworkIPs()) {
 function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-const commandHtml = escapeHtml(command.join(" "));
 
-// --- Process state ---
+// --- Session manager instance ---
 
-let processExited = false;
-let processExitCode: number | null = null;
+const sessionManager = new SessionManager(LOG_DIR, MAX_HISTORY, PTY_MODE, () => {});
 
-// Bounded history buffers - old chunks are dropped when exceeding MAX_HISTORY
-// droppedCount tracks how many chunks were trimmed so ?from=N offsets stay valid
-const stdoutHistory: string[] = [];
-let stdoutDropped = 0;
-const stderrHistory: string[] = [];
-let stderrDropped = 0;
-const combinedHistory: { type: "stdout" | "stderr"; data: string }[] = [];
-let combinedDropped = 0;
+// Load any previously completed sessions from disk
+sessionManager.loadCompletedSessions();
 
-function trimHistory<T>(history: T[], dropped: number): number {
-  if (history.length > MAX_HISTORY) {
-    const excess = history.length - MAX_HISTORY;
-    history.splice(0, excess);
-    return dropped + excess;
-  }
-  return dropped;
-}
+// Create the initial session from CLI command
+const initialSession = sessionManager.createSession(INITIAL_COMMAND);
 
-// Active SSE client connections per stream
-const stdoutClients = new Set<ReadableStreamDefaultController>();
-const stderrClients = new Set<ReadableStreamDefaultController>();
-const combinedClients = new Set<ReadableStreamDefaultController>();
-
-let activeConnectionCount = 0;
-const textEncoder = new TextEncoder();
-const HEARTBEAT_INTERVAL_MS = 15_000;
-let heartbeatTimer: Timer | null = null;
-
-function startHeartbeat() {
-  if (heartbeatTimer) return;
-  heartbeatTimer = setInterval(() => {
-    const ping = textEncoder.encode(": ping\n\n");
-    for (const client of stdoutClients) { try { client.enqueue(ping); } catch { dropClient(client, stdoutClients); } }
-    for (const client of stderrClients) { try { client.enqueue(ping); } catch { dropClient(client, stderrClients); } }
-    for (const client of combinedClients) { try { client.enqueue(ping); } catch { dropClient(client, combinedClients); } }
-  }, HEARTBEAT_INTERVAL_MS);
-}
-
-function stopHeartbeat() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
-}
-
-// --- SSE helpers ---
-
-function encodeSSE(data: string, eventType?: string, id?: number): Uint8Array {
-  const base64 = btoa(unescape(encodeURIComponent(data)));
-  const idLine = id !== undefined ? `id: ${id}\n` : "";
-  const eventLine = eventType ? `event: ${eventType}\n` : "";
-  return textEncoder.encode(`${idLine}${eventLine}data: ${base64}\n\n`);
-}
-
-function sendToClient(client: ReadableStreamDefaultController, data: string, eventType?: string, id?: number) {
-  try { client.enqueue(encodeSSE(data, eventType, id)); } catch { /* client disconnected */ }
-}
-
-function dropClient(client: ReadableStreamDefaultController, clients: Set<ReadableStreamDefaultController>) {
-  if (clients.delete(client)) {
-    activeConnectionCount--;
-    try { client.close(); } catch { /* already closed */ }
-    if (activeConnectionCount === 0) stopHeartbeat();
-    shutdownIfIdle();
-  }
-}
-
-function broadcastToClients(clients: Set<ReadableStreamDefaultController>, data: string, eventType?: string, id?: number) {
-  if (!clients.size) return;
-  const encoded = encodeSSE(data, eventType, id);
-  for (const client of clients) {
-    try {
-      client.enqueue(encoded);
-    } catch {
-      dropClient(client, clients);
-    }
-  }
-}
-
-function createSSEStream(
-  clients: Set<ReadableStreamDefaultController>,
-  replayHistory: (client: ReadableStreamDefaultController) => void
-): ReadableStream {
-  activeConnectionCount++;
-  if (activeConnectionCount === 1) startHeartbeat();
-  let thisClient!: ReadableStreamDefaultController;
-  return new ReadableStream({
-    start(controller) {
-      thisClient = controller;
-      clients.add(controller);
-      replayHistory(controller);
-    },
-    cancel() {
-      activeConnectionCount--;
-      clients.delete(thisClient);
-      if (activeConnectionCount === 0) stopHeartbeat();
-      shutdownIfIdle();
-    },
-  });
-}
+// --- HTTP server ---
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 };
-
-// --- Spawn the child process ---
-
-let spawnError: string | null = null;
-let proc: ReturnType<typeof spawn> | null = null;
-let ptyProc: any = null;
-
-function writeStdin(text: string, raw = false) {
-  const data = raw ? text : text + "\n";
-  if (PTY_MODE && ptyProc) {
-    ptyProc.write(data);
-  } else if (proc) {
-    try { proc.stdin.write(data); proc.stdin.flush(); } catch { /* closed */ }
-  }
-}
-
-function killChild() {
-  if (PTY_MODE && ptyProc) {
-    ptyProc.kill();
-  } else if (proc) {
-    proc.kill();
-  }
-}
-
-if (PTY_MODE) {
-  try {
-    const nodePty = require("node-pty");
-    ptyProc = nodePty.spawn(command[0], command.slice(1), {
-      name: "xterm-256color",
-      cols: 80,
-      rows: 24,
-      cwd: process.cwd(),
-      env: process.env,
-    });
-  } catch (err) {
-    spawnError = err instanceof Error ? err.message : String(err);
-    console.error(`Failed to spawn PTY process: ${spawnError}`);
-    processExited = true;
-    processExitCode = 127;
-  }
-} else {
-  try {
-    proc = spawn({ cmd: command, stdout: "pipe", stderr: "pipe", stdin: "pipe" });
-  } catch (err) {
-    spawnError = err instanceof Error ? err.message : String(err);
-    console.error(`Failed to spawn process: ${spawnError}`);
-    processExited = true;
-    processExitCode = 127;
-  }
-}
-
-// --- HTTP server ---
-
-function parseReplayOffset(req: Request, url: URL): number {
-  const lastEventId = req.headers.get("Last-Event-ID");
-  if (lastEventId) return parseInt(lastEventId, 10) + 1 || 0;
-  return Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
-}
-
-const exitMessage = () => `\r\n[Process exited with code ${processExitCode}]\r\n`;
 
 function checkAuth(req: Request, url: URL): boolean {
   if (!AUTH_TOKEN) return true;
@@ -319,6 +616,12 @@ function checkAuth(req: Request, url: URL): boolean {
 
 const UNAUTHORIZED = () => new Response("Unauthorized", { status: 401 });
 
+function parseReplayOffset(req: Request, url: URL): number {
+  const lastEventId = req.headers.get("Last-Event-ID");
+  if (lastEventId) return parseInt(lastEventId, 10) + 1 || 0;
+  return Math.max(0, parseInt(url.searchParams.get("from") ?? "0") || 0);
+}
+
 const server = Bun.serve({
   port: PORT,
   hostname: HOST,
@@ -327,238 +630,470 @@ const server = Bun.serve({
     const url = new URL(req.url);
     const { pathname } = url;
 
+    // Session list page
     if (pathname === "/" || pathname === "/index.html") {
       const hasControl = checkAuth(req, url);
-      const html = HTML.replace('__HAS_CONTROL__', String(hasControl));
+      const html = generateSessionListHTML(sessionManager.listSessions(), AUTH_TOKEN, hasControl);
       return new Response(html, { headers: { "Content-Type": "text/html" } });
     }
 
-    if (pathname === "/status") {
-      return Response.json({ running: !processExited, exitCode: processExitCode, spawnError });
+    // API: list sessions
+    if (pathname === "/api/sessions" && req.method === "GET") {
+      return Response.json(sessionManager.listSessions());
     }
 
-    if (pathname === "/kill" && req.method === "POST") {
+    // API: create session
+    if (pathname === "/api/sessions" && req.method === "POST") {
       if (!checkAuth(req, url)) return UNAUTHORIZED();
-      if (!processExited) killChild();
+      try {
+        const body = await req.json();
+        if (!body.command || !Array.isArray(body.command) || body.command.length === 0) {
+          return Response.json({ error: "command is required and must be a non-empty array" }, { status: 400 });
+        }
+        const session = sessionManager.createSession(body.command);
+        return Response.json(session.getMetadata(), { status: 201 });
+      } catch (err) {
+        return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 400 });
+      }
+    }
+
+    // Session view page
+    const sessionViewMatch = pathname.match(/^\/sessions\/([^\/]+)$/);
+    if (sessionViewMatch) {
+      const sessionId = sessionViewMatch[1];
+      const session = sessionManager.getSession(sessionId);
+      if (session) {
+        const hasControl = checkAuth(req, url);
+        const html = generateSessionHTML(session, AUTH_TOKEN, hasControl);
+        return new Response(html, { headers: { "Content-Type": "text/html" } });
+      }
+      const meta = sessionManager.getSessionMetadata(sessionId);
+      if (meta) {
+        const hasControl = checkAuth(req, url);
+        const html = generateCompletedSessionHTML(meta, AUTH_TOKEN, hasControl);
+        return new Response(html, { headers: { "Content-Type": "text/html" } });
+      }
+      return new Response("Session not found", { status: 404 });
+    }
+
+    // Session SSE streams
+    const sessionSseMatch = pathname.match(/^\/sessions\/([^\/]+)\/(stdout|stderr|combined)$/);
+    if (sessionSseMatch) {
+      const sessionId = sessionSseMatch[1];
+      const streamType = sessionSseMatch[2] as "stdout" | "stderr" | "combined";
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return new Response("Session not found", { status: 404 });
+      }
+      const from = parseReplayOffset(req, url);
+      const exitMessage = () => `\r\n[Process exited with code ${session.exitCode}]\r\n`;
+
+      if (streamType === "stdout") {
+        return new Response(session.createSSEStream(session.stdoutClients, client => {
+          const idx = Math.max(0, from - session.stdoutDropped);
+          for (let i = idx; i < session.stdoutHistory.length; i++) session.sendToClient(client, session.stdoutHistory[i], undefined, session.stdoutDropped + i);
+          if (session.processExited) session.sendToClient(client, exitMessage());
+        }), { headers: SSE_HEADERS });
+      }
+
+      if (streamType === "stderr") {
+        return new Response(session.createSSEStream(session.stderrClients, client => {
+          const idx = Math.max(0, from - session.stderrDropped);
+          for (let i = idx; i < session.stderrHistory.length; i++) session.sendToClient(client, session.stderrHistory[i], undefined, session.stderrDropped + i);
+          if (session.processExited) session.sendToClient(client, exitMessage());
+        }), { headers: SSE_HEADERS });
+      }
+
+      if (streamType === "combined") {
+        return new Response(session.createSSEStream(session.combinedClients, client => {
+          const idx = Math.max(0, from - session.combinedDropped);
+          for (let i = idx; i < session.combinedHistory.length; i++) {
+            const { type, data } = session.combinedHistory[i];
+            session.sendToClient(client, data, type, session.combinedDropped + i);
+          }
+          if (session.processExited) session.sendToClient(client, exitMessage());
+        }), { headers: SSE_HEADERS });
+      }
+    }
+
+    // Session status
+    const sessionStatusMatch = pathname.match(/^\/sessions\/([^\/]+)\/status$/);
+    if (sessionStatusMatch) {
+      const sessionId = sessionStatusMatch[1];
+      const session = sessionManager.getSession(sessionId);
+      if (session) return Response.json(session.getStatus());
+      const meta = sessionManager.getSessionMetadata(sessionId);
+      if (meta) {
+        return Response.json({
+          running: !meta.processExited,
+          exitCode: meta.exitCode,
+          spawnError: meta.spawnError,
+        });
+      }
+      return Response.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    // Session kill
+    const sessionKillMatch = pathname.match(/^\/sessions\/([^\/]+)\/kill$/);
+    if (sessionKillMatch && req.method === "POST") {
+      if (!checkAuth(req, url)) return UNAUTHORIZED();
+      const sessionId = sessionKillMatch[1];
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return Response.json({ error: "Session not found" }, { status: 404 });
+      }
+      if (!session.processExited) session.kill();
       return Response.json({ ok: true });
     }
 
-    if (pathname === "/stdin" && req.method === "POST") {
+    // Session stdin
+    const sessionStdinMatch = pathname.match(/^\/sessions\/([^\/]+)\/stdin$/);
+    if (sessionStdinMatch && req.method === "POST") {
       if (!checkAuth(req, url)) return UNAUTHORIZED();
-      if (!processExited) {
+      const sessionId = sessionStdinMatch[1];
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return Response.json({ error: "Session not found" }, { status: 404 });
+      }
+      if (!session.processExited) {
         const text = await req.text();
         const raw = url.searchParams.get("raw") === "1";
-        writeStdin(text, raw);
+        session.writeStdin(text, raw);
       }
       return Response.json({ ok: true });
     }
 
-    if (pathname === "/signal" && req.method === "POST") {
+    // Session signal
+    const sessionSignalMatch = pathname.match(/^\/sessions\/([^\/]+)\/signal$/);
+    if (sessionSignalMatch && req.method === "POST") {
       if (!checkAuth(req, url)) return UNAUTHORIZED();
-      if (!processExited) {
+      const sessionId = sessionSignalMatch[1];
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return Response.json({ error: "Session not found" }, { status: 404 });
+      }
+      if (!session.processExited) {
         const { signal } = await req.json();
-        const sigMap: Record<string, number> = { SIGINT: 2, SIGTERM: 15, SIGKILL: 9 };
-        const sigNum = sigMap[signal];
-        if (sigNum !== undefined) {
-          if (PTY_MODE && ptyProc) {
-            try { ptyProc.kill(sigNum); } catch { /* ignore */ }
-          } else if (proc) {
-            try { proc.kill(sigNum); } catch { /* ignore */ }
-          }
-        }
+        session.sendSignal(signal);
       }
       return Response.json({ ok: true });
     }
 
-    if (pathname === "/resize" && req.method === "POST") {
+    // Session resize
+    const sessionResizeMatch = pathname.match(/^\/sessions\/([^\/]+)\/resize$/);
+    if (sessionResizeMatch && req.method === "POST") {
       if (!checkAuth(req, url)) return UNAUTHORIZED();
-      if (PTY_MODE && ptyProc && !processExited) {
+      const sessionId = sessionResizeMatch[1];
+      const session = sessionManager.getSession(sessionId);
+      if (!session) {
+        return Response.json({ error: "Session not found" }, { status: 404 });
+      }
+      if (!session.processExited) {
         const { cols, rows } = await req.json();
-        if (cols > 0 && rows > 0) {
-          try { ptyProc.resize(cols, rows); } catch { /* ignore */ }
-        }
+        session.resize(cols, rows);
       }
       return Response.json({ ok: true });
-    }
-
-    if (pathname === "/stdout") {
-      const from = parseReplayOffset(req, url);
-      return new Response(createSSEStream(stdoutClients, client => {
-        const idx = Math.max(0, from - stdoutDropped);
-        for (let i = idx; i < stdoutHistory.length; i++) sendToClient(client, stdoutHistory[i], undefined, stdoutDropped + i);
-        if (processExited) sendToClient(client, exitMessage());
-      }), { headers: SSE_HEADERS });
-    }
-
-    if (pathname === "/stderr") {
-      const from = parseReplayOffset(req, url);
-      return new Response(createSSEStream(stderrClients, client => {
-        const idx = Math.max(0, from - stderrDropped);
-        for (let i = idx; i < stderrHistory.length; i++) sendToClient(client, stderrHistory[i], undefined, stderrDropped + i);
-        if (processExited) sendToClient(client, exitMessage());
-      }), { headers: SSE_HEADERS });
-    }
-
-    if (pathname === "/combined") {
-      const from = parseReplayOffset(req, url);
-      return new Response(createSSEStream(combinedClients, client => {
-        const idx = Math.max(0, from - combinedDropped);
-        for (let i = idx; i < combinedHistory.length; i++) {
-          const { type, data } = combinedHistory[i];
-          sendToClient(client, data, type, combinedDropped + i);
-        }
-        if (processExited) sendToClient(client, exitMessage());
-      }), { headers: SSE_HEADERS });
     }
 
     return new Response("Not Found", { status: 404 });
   },
 });
 
-// --- Pipe process output to SSE clients ---
+// --- Signal handling ---
 
-function handleStdoutData(data: string) {
-  stdoutHistory.push(data);
-  stdoutDropped = trimHistory(stdoutHistory, stdoutDropped);
-  const stdoutEventId = stdoutDropped + stdoutHistory.length - 1;
-  broadcastToClients(stdoutClients, data, undefined, stdoutEventId);
-  combinedHistory.push({ type: "stdout", data });
-  combinedDropped = trimHistory(combinedHistory, combinedDropped);
-  const combinedEventId = combinedDropped + combinedHistory.length - 1;
-  broadcastToClients(combinedClients, data, "stdout", combinedEventId);
-  appendLog(stdoutLogPath, data);
-  appendLog(combinedLogPath, data);
-}
-
-function handleStderrData(data: string) {
-  stderrHistory.push(data);
-  stderrDropped = trimHistory(stderrHistory, stderrDropped);
-  const stderrEventId = stderrDropped + stderrHistory.length - 1;
-  broadcastToClients(stderrClients, data, undefined, stderrEventId);
-  combinedHistory.push({ type: "stderr", data });
-  combinedDropped = trimHistory(combinedHistory, combinedDropped);
-  const combinedEventId = combinedDropped + combinedHistory.length - 1;
-  broadcastToClients(combinedClients, data, "stderr", combinedEventId);
-  appendLog(stderrLogPath, data);
-  appendLog(combinedLogPath, data);
-}
-
-function handleProcessExit(code: number) {
-  processExitCode = code;
-  processExited = true;
-  const message = exitMessage();
-  broadcastToClients(stdoutClients, message);
-  broadcastToClients(stderrClients, message);
-  broadcastToClients(combinedClients, message);
-  console.log(`\nProcess exited with code ${code}`);
-  updateMetadata(code);
-  shutdownIfIdle();
-}
-
-if (!spawnError && PTY_MODE && ptyProc) {
-  // PTY mode: single output stream, no separate stderr
-  ptyProc.onData((data: string) => {
-    handleStdoutData(data);
-  });
-  ptyProc.onExit(({ exitCode }: { exitCode: number }) => {
-    handleProcessExit(exitCode);
-  });
-} else if (!spawnError && proc) {
-  const stdoutDecoder = new TextDecoder();
-  const stderrDecoder = new TextDecoder();
-
-  proc.stdout.pipeTo(new WritableStream({
-    write(chunk) {
-      handleStdoutData(stdoutDecoder.decode(chunk, { stream: true }));
-    },
-    close() {
-      const remaining = stdoutDecoder.decode();
-      if (remaining) handleStdoutData(remaining);
-    },
-  })).catch(err => {
-    console.error("stdout pipe error:", err.message);
-  });
-
-  proc.stderr.pipeTo(new WritableStream({
-    write(chunk) {
-      handleStderrData(stderrDecoder.decode(chunk, { stream: true }));
-    },
-    close() {
-      const remaining = stderrDecoder.decode();
-      if (remaining) handleStderrData(remaining);
-    },
-  })).catch(err => {
-    console.error("stderr pipe error:", err.message);
-  });
-
-  proc.exited.then((code) => {
-    handleProcessExit(code);
-  }).catch(err => {
-    console.error("Process exited with error:", err.message);
-    processExitCode = 1;
-    processExited = true;
-    const message = `\r\n[Process failed: ${err.message}]\r\n`;
-    broadcastToClients(stdoutClients, message);
-    broadcastToClients(stderrClients, message);
-    broadcastToClients(combinedClients, message);
-    updateMetadata(1);
-    shutdownIfIdle();
-  });
-} else if (spawnError) {
-  broadcastToClients(stdoutClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
-  broadcastToClients(stderrClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
-  broadcastToClients(combinedClients, `\r\n[Failed to start process: ${spawnError}]\r\n`);
-}
-
-let shutdownTimer: Timer | null = null;
-let hasShutdown = false;
-
-function shutdown(reason: string) {
-  if (hasShutdown) return;
-  hasShutdown = true;
-  console.log(`\n${reason}`);
-  stopHeartbeat();
-  if (!processExited) {
-    try { killChild(); } catch { /* already dead */ }
-  }
-  server.stop();
-}
-
-function cancelPendingShutdown() {
-  if (shutdownTimer) {
-    clearTimeout(shutdownTimer);
-    shutdownTimer = null;
-  }
-}
-
-function shutdownIfIdle() {
-  if (!processExited || activeConnectionCount > 0) {
-    cancelPendingShutdown();
-    return;
-  }
-  if (shutdownTimer) return;
-  shutdownTimer = setTimeout(() => {
-    if (activeConnectionCount === 0) {
-      shutdown("All clients disconnected, shutting down...");
-    }
-  }, 5000);
-}
-
-setTimeout(() => {
-  if (activeConnectionCount === 0) {
-    shutdown("No clients connected, shutting down...");
-  }
-}, 60000);
-
-// Forward signals to child process and clean up
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
-    shutdown(`Received ${sig}, shutting down...`);
+    console.log(`\nReceived ${sig}, shutting down...`);
+    for (const session of sessionManager.sessions.values()) {
+      session.cleanup();
+    }
+    server.stop();
     process.exit(0);
   });
 }
 
-const HTML = `<!DOCTYPE html>
+// --- HTML templates ---
+
+function generateSessionListHTML(sessions: SessionMetadata[], authToken: string | null, hasControl: boolean): string {
+  const rows = sessions.map(s => {
+    const statusClass = s.processExited ? (s.exitCode === 0 ? "status-exited-ok" : "status-exited-err") : "status-running";
+    const statusText = s.processExited ? `Exited (${s.exitCode})` : "Running";
+    const startTime = new Date(s.startTime).toLocaleTimeString();
+    const duration = s.durationMs ? `${(s.durationMs / 1000).toFixed(1)}s` : "—";
+    const cmd = escapeHtml(s.command.join(" "));
+    const shortId = s.id.slice(0, 8);
+    return `<tr>
+      <td><a href="/sessions/${s.id}" class="session-link">${shortId}</a></td>
+      <td class="cmd-cell" title="${cmd}">${cmd}</td>
+      <td><span class="${statusClass}">${statusText}</span></td>
+      <td>${startTime}</td>
+      <td>${duration}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>proc-web: Sessions</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    h1 { color: #4ec9b0; font-size: 20px; margin-bottom: 16px; }
+    .new-session {
+      background: #2d2d2d;
+      padding: 16px;
+      border-radius: 6px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .new-session input {
+      flex: 1;
+      background: #1e1e1e;
+      border: 1px solid #4a4a4a;
+      color: #d4d4d4;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-family: Monaco, Menlo, 'Courier New', monospace;
+      font-size: 13px;
+    }
+    .new-session input:focus { outline: none; border-color: #4ec9b0; }
+    .btn {
+      background: #3c3c3c;
+      color: #d4d4d4;
+      border: 1px solid #555;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .btn:hover { background: #4a4a4a; }
+    .btn-primary { background: #4ec9b0; color: #1e1e1e; border-color: #4ec9b0; font-weight: 600; }
+    .btn-primary:hover { background: #3db89e; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #2d2d2d;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    th {
+      background: #252526;
+      text-align: left;
+      padding: 10px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    td {
+      padding: 10px 14px;
+      border-top: 1px solid #3d3d3d;
+      font-size: 13px;
+    }
+    .session-link {
+      color: #4ec9b0;
+      text-decoration: none;
+      font-family: Monaco, Menlo, monospace;
+    }
+    .session-link:hover { text-decoration: underline; }
+    .cmd-cell {
+      font-family: Monaco, Menlo, monospace;
+      font-size: 12px;
+      max-width: 400px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .status-running { color: #4ec9b0; }
+    .status-exited-ok { color: #4ec9b0; }
+    .status-exited-err { color: #f14c4c; }
+    .empty { text-align: center; padding: 40px; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>proc-web: Sessions</h1>
+  ${hasControl ? `<div class="new-session">
+    <input type="text" id="new-cmd" placeholder="Enter command to run…" autocomplete="off" />
+    <button class="btn btn-primary" onclick="createSession()">Run</button>
+  </div>` : ""}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Command</th>
+        <th>Status</th>
+        <th>Started</th>
+        <th>Duration</th>
+      </tr>
+    </thead>
+    <tbody id="sessions-body">
+      ${rows || '<tr><td colspan="5" class="empty">No sessions yet</td></tr>'}
+    </tbody>
+  </table>
+  <script>
+    const AUTH_TOKEN = ${authToken ? `'${authToken}'` : 'null'};
+    function authHeaders() { return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}; }
+
+    function createSession() {
+      const input = document.getElementById('new-cmd');
+      const cmd = input.value.trim();
+      if (!cmd) return;
+      const command = cmd.split(/\\s+/);
+      fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ command }),
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.id) {
+          window.location.href = '/sessions/' + data.id;
+        }
+      })
+      .catch(() => {});
+    }
+
+    document.getElementById('new-cmd').addEventListener('keydown', e => {
+      if (e.key === 'Enter') createSession();
+    });
+
+    // Auto-refresh session list
+    function refreshSessions() {
+      fetch('/api/sessions')
+        .then(r => r.json())
+        .then(sessions => {
+          const tbody = document.getElementById('sessions-body');
+          if (sessions.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="empty">No sessions yet</td></tr>';
+            return;
+          }
+          tbody.innerHTML = sessions.map(s => {
+            const statusClass = s.processExited ? (s.exitCode === 0 ? 'status-exited-ok' : 'status-exited-err') : 'status-running';
+            const statusText = s.processExited ? 'Exited (' + s.exitCode + ')' : 'Running';
+            const startTime = new Date(s.startTime).toLocaleTimeString();
+            const duration = s.durationMs ? (s.durationMs / 1000).toFixed(1) + 's' : '—';
+            const cmd = s.command.join(' ');
+            const shortId = s.id.slice(0, 8);
+            return '<tr>' +
+              '<td><a href="/sessions/' + s.id + '" class="session-link">' + shortId + '</a></td>' +
+              '<td class="cmd-cell" title="' + cmd + '">' + cmd + '</td>' +
+              '<td><span class="' + statusClass + '">' + statusText + '</span></td>' +
+              '<td>' + startTime + '</td>' +
+              '<td>' + duration + '</td>' +
+              '</tr>';
+          }).join('');
+        })
+        .catch(() => {});
+    }
+    setInterval(refreshSessions, 2000);
+  </script>
+</body>
+</html>`;
+}
+
+function generateCompletedSessionHTML(meta: SessionMetadata, authToken: string | null, hasControl: boolean): string {
+  const commandHtml = escapeHtml(meta.command.join(" "));
+  const shortId = meta.id.slice(0, 8);
+  const statusText = meta.spawnError ? "Spawn Error" : `Exited (${meta.exitCode})`;
+  const statusClass = meta.spawnError || meta.exitCode !== 0 ? "status-exited" : "status-running";
+  const startTime = new Date(meta.startTime).toLocaleString();
+  const duration = meta.durationMs ? `${(meta.durationMs / 1000).toFixed(1)}s` : "—";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>proc-web: ${commandHtml}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    header {
+      background: #2d2d2d;
+      padding: 8px 16px;
+      border-bottom: 1px solid #3d3d3d;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+      border-radius: 6px;
+      margin-bottom: 24px;
+    }
+    .logo { font-size: 14px; font-weight: 600; color: #4ec9b0; flex-shrink: 0; cursor: pointer; }
+    .session-id { font-size: 11px; color: #888; font-family: Monaco, Menlo, monospace; flex-shrink: 0; }
+    .command {
+      font-family: Monaco, Menlo, 'Courier New', monospace;
+      font-size: 12px;
+      color: #d4d4d4;
+      background: #333;
+      padding: 3px 8px;
+      border-radius: 4px;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .status-running { color: #4ec9b0; }
+    .status-exited { color: #f14c4c; }
+    .details {
+      background: #2d2d2d;
+      padding: 16px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+    }
+    .details h3 { color: #4ec9b0; font-size: 14px; margin-bottom: 12px; }
+    .detail-row { display: flex; gap: 8px; margin-bottom: 8px; font-size: 13px; }
+    .detail-label { color: #888; min-width: 100px; }
+    .detail-value { color: #d4d4d4; font-family: Monaco, Menlo, monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="logo" onclick="window.location.href='/'">proc-web</span>
+    <span class="session-id">${shortId}</span>
+    <span class="command" title="${commandHtml}">${commandHtml}</span>
+    <div class="header-right">
+      <span class="${statusClass}">${statusText}</span>
+    </div>
+  </header>
+
+  <div class="details">
+    <h3>Session Details</h3>
+    <div class="detail-row"><span class="detail-label">Session ID:</span><span class="detail-value">${meta.id}</span></div>
+    <div class="detail-row"><span class="detail-label">Command:</span><span class="detail-value">${commandHtml}</span></div>
+    <div class="detail-row"><span class="detail-label">Started:</span><span class="detail-value">${startTime}</span></div>
+    <div class="detail-row"><span class="detail-label">Duration:</span><span class="detail-value">${duration}</span></div>
+    <div class="detail-row"><span class="detail-label">Exit Code:</span><span class="detail-value">${meta.exitCode ?? "—"}</span></div>
+    ${meta.spawnError ? `<div class="detail-row"><span class="detail-label">Error:</span><span class="detail-value">${escapeHtml(meta.spawnError)}</span></div>` : ""}
+  </div>
+</body>
+</html>`;
+}
+
+function generateSessionHTML(session: Session, authToken: string | null, hasControl: boolean): string {
+  const commandHtml = escapeHtml(session.command.join(" "));
+  const shortId = session.id.slice(0, 8);
+
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -585,7 +1120,8 @@ const HTML = `<!DOCTYPE html>
       gap: 12px;
       flex-shrink: 0;
     }
-    .logo { font-size: 14px; font-weight: 600; color: #4ec9b0; flex-shrink: 0; }
+    .logo { font-size: 14px; font-weight: 600; color: #4ec9b0; flex-shrink: 0; cursor: pointer; }
+    .session-id { font-size: 11px; color: #888; font-family: Monaco, Menlo, monospace; flex-shrink: 0; }
     .command {
       font-family: Monaco, Menlo, 'Courier New', monospace;
       font-size: 12px;
@@ -691,7 +1227,8 @@ const HTML = `<!DOCTYPE html>
 </head>
 <body>
   <header>
-    <span class="logo">proc-web</span>
+    <span class="logo" onclick="window.location.href='/'">proc-web</span>
+    <span class="session-id">${shortId}</span>
     <span class="command" title="${commandHtml}">${commandHtml}</span>
     <div class="header-right">
       <span id="status-el" class="status-running">● Running</span>
@@ -747,8 +1284,9 @@ const HTML = `<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.js"></script>
   <script>
-    const AUTH_TOKEN = ${AUTH_TOKEN ? `'${AUTH_TOKEN}'` : 'null'};
-    const HAS_CONTROL = __HAS_CONTROL__;
+    const SESSION_ID = '${session.id}';
+    const AUTH_TOKEN = ${authToken ? `'${authToken}'` : 'null'};
+    const HAS_CONTROL = ${hasControl};
     function authHeaders() { return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}; }
 
     // Hide control elements in read-only mode
@@ -785,7 +1323,7 @@ const HTML = `<!DOCTYPE html>
 
     function sendResize() {
       const term = panels[currentTab].terminal;
-      fetch('/resize', {
+      fetch('/sessions/' + SESSION_ID + '/resize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ cols: term.cols, rows: term.rows }),
@@ -809,7 +1347,6 @@ const HTML = `<!DOCTYPE html>
       });
     }
 
-    // --- Auto-scroll ---
     let autoScroll = true;
     function toggleScroll() {
       autoScroll = !autoScroll;
@@ -823,10 +1360,9 @@ const HTML = `<!DOCTYPE html>
       if (autoScroll) terminal.scrollToBottom();
     }
 
-    // --- Process status polling ---
     let processExited = false;
     function updateStatus() {
-      fetch('/status').then(r => r.json()).then(s => {
+      fetch('/sessions/' + SESSION_ID + '/status').then(r => r.json()).then(s => {
         const el = document.getElementById('status-el');
         if (s.spawnError) {
           processExited = true;
@@ -851,30 +1387,27 @@ const HTML = `<!DOCTYPE html>
     const statusTimer = setInterval(updateStatus, 1000);
     updateStatus();
 
-    // --- Kill ---
     function killProcess() {
-      fetch('/kill', { method: 'POST', headers: authHeaders() }).catch(() => {});
+      fetch('/sessions/' + SESSION_ID + '/kill', { method: 'POST', headers: authHeaders() }).catch(() => {});
     }
 
-    // --- Stdin ---
     function sendStdin() {
       const inp = document.getElementById('stdin-input');
       const text = inp.value;
       if (!text) return;
-      fetch('/stdin', { method: 'POST', body: text, headers: authHeaders() }).catch(() => {});
+      fetch('/sessions/' + SESSION_ID + '/stdin', { method: 'POST', body: text, headers: authHeaders() }).catch(() => {});
       inp.value = '';
     }
     function sendSignalChar(ch) {
-      fetch('/stdin?raw=1', { method: 'POST', body: ch, headers: authHeaders() }).catch(() => {});
+      fetch('/sessions/' + SESSION_ID + '/stdin?raw=1', { method: 'POST', body: ch, headers: authHeaders() }).catch(() => {});
     }
     function sendSignal(sig) {
-      fetch('/signal', { method: 'POST', body: JSON.stringify({ signal: sig }), headers: { 'Content-Type': 'application/json', ...authHeaders() } }).catch(() => {});
+      fetch('/sessions/' + SESSION_ID + '/signal', { method: 'POST', body: JSON.stringify({ signal: sig }), headers: { 'Content-Type': 'application/json', ...authHeaders() } }).catch(() => {});
     }
     document.getElementById('stdin-input').addEventListener('keydown', e => {
       if (e.key === 'Enter') sendStdin();
     });
 
-    // --- Download current tab output ---
     function downloadOutput() {
       const { terminal } = panels[currentTab];
       const buf = terminal.buffer.active;
@@ -891,7 +1424,6 @@ const HTML = `<!DOCTYPE html>
       URL.revokeObjectURL(a.href);
     }
 
-    // --- Search ---
     let searchVisible = false;
     function toggleSearch() {
       searchVisible = !searchVisible;
@@ -942,8 +1474,6 @@ const HTML = `<!DOCTYPE html>
       }
     });
 
-    // --- SSE helpers ---
-
     function decodeBase64(encoded) {
       return decodeURIComponent(escape(atob(encoded)));
     }
@@ -965,18 +1495,17 @@ const HTML = `<!DOCTYPE html>
       connect();
     }
 
-    // Track last event ID for reconnect resume
     let stdoutLastId = -1, stderrLastId = -1, combinedLastId = -1;
 
-    connectSSE(() => '/stdout' + (stdoutLastId >= 0 ? '?from=' + (stdoutLastId + 1) : ''), source => {
+    connectSSE(() => '/sessions/' + SESSION_ID + '/stdout' + (stdoutLastId >= 0 ? '?from=' + (stdoutLastId + 1) : ''), source => {
       source.onmessage = e => { if (e.lastEventId) stdoutLastId = parseInt(e.lastEventId); writeToTerminal(panels.stdout.terminal, decodeBase64(e.data)); };
     });
 
-    connectSSE(() => '/stderr' + (stderrLastId >= 0 ? '?from=' + (stderrLastId + 1) : ''), source => {
+    connectSSE(() => '/sessions/' + SESSION_ID + '/stderr' + (stderrLastId >= 0 ? '?from=' + (stderrLastId + 1) : ''), source => {
       source.onmessage = e => { if (e.lastEventId) stderrLastId = parseInt(e.lastEventId); writeToTerminal(panels.stderr.terminal, decodeBase64(e.data)); };
     });
 
-    connectSSE(() => '/combined' + (combinedLastId >= 0 ? '?from=' + (combinedLastId + 1) : ''), source => {
+    connectSSE(() => '/sessions/' + SESSION_ID + '/combined' + (combinedLastId >= 0 ? '?from=' + (combinedLastId + 1) : ''), source => {
       source.addEventListener('stdout', e => {
         if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
         writeToTerminal(panels.combined.terminal, decodeBase64(e.data));
@@ -990,3 +1519,4 @@ const HTML = `<!DOCTYPE html>
   </script>
 </body>
 </html>`;
+}

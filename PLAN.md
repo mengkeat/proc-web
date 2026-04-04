@@ -233,13 +233,13 @@ These features make the tool feel complete for repeated use.
 **Why:** One-server-one-process is limiting for real usage.
 
 **Tasks**
-- Assign session IDs
-- Store session metadata
-- Add routes/pages for viewing specific sessions
-- Support active and completed sessions
+- [x] Assign session IDs
+- [x] Store session metadata
+- [x] Add routes/pages for viewing specific sessions
+- [x] Support active and completed sessions
 
 **Done when**
-- Users can revisit and share specific process runs
+- [x] Users can revisit and share specific process runs
 
 ### 4.2 Session list / history page
 **Priority:** Medium  
