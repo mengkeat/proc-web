@@ -246,12 +246,12 @@ These features make the tool feel complete for repeated use.
 **Why:** Persisted logs become much more useful when discoverable.
 
 **Tasks**
-- Add a simple index page of sessions
-- Show command, status, start time, duration, exit code
-- Allow reopening completed sessions
+- [x] Add a simple index page of sessions
+- [x] Show command, status, start time, duration, exit code
+- [x] Allow reopening completed sessions
 
 **Done when**
-- Users can browse previous runs without knowing raw URLs
+- [x] Users can browse previous runs without knowing raw URLs
 
 ### 4.3 Restart / rerun flows
 **Priority:** Medium  

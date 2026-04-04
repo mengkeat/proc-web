@@ -213,4 +213,24 @@ describe("Phase 4.1: Introduce sessions", () => {
       cleanup();
     }
   });
+
+  test("session list page shows session details", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Sessions");
+      expect(html).toContain("ID");
+      expect(html).toContain("Command");
+      expect(html).toContain("Status");
+      expect(html).toContain("Started");
+      expect(html).toContain("Duration");
+      // Should show at least one session link
+      expect(html).toContain("session-link");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
 });
