@@ -391,3 +391,59 @@ describe("Phase 4.1: Introduce sessions", () => {
     }
   });
 });
+
+describe("Phase 5.3: Improved client rendering performance", () => {
+  test("session HTML includes write batching for rendering performance", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      expect(viewRes.status).toBe(200);
+      const html = await viewRes.text();
+      expect(html).toContain("writeBuffers");
+      expect(html).toContain("flushBuffers");
+      expect(html).toContain("requestAnimationFrame(flushBuffers)");
+      expect(html).toContain("flushScheduled");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("writeToTerminal uses panel name instead of terminal object", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("writeToTerminal('stdout'");
+      expect(html).toContain("writeToTerminal('stderr'");
+      expect(html).toContain("writeToTerminal('combined'");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("switchTab flushes buffer for new tab", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toMatch(/switchTab\(name\)[\s\S]*?writeBuffers\[name\]/);
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+});

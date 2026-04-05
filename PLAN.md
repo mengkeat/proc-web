@@ -314,13 +314,13 @@ These are quality-of-life features that improve day-to-day usage.
 **Why:** Extremely chatty commands can stress the browser.
 
 **Tasks**
-- Batch terminal writes per animation frame
-- Coalesce small chunks
-- Tune scrollback configuration
-- Avoid unnecessary rendering on hidden tabs
+- [x] Batch terminal writes per animation frame
+- [x] Coalesce small chunks
+- [x] Tune scrollback configuration
+- [x] Avoid unnecessary rendering on hidden tabs
 
 **Done when**
-- High-volume output stays responsive in the browser
+- [x] High-volume output stays responsive in the browser
 
 ### 5.4 Visual polish and UX refinements
 **Priority:** Low  

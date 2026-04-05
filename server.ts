@@ -1449,6 +1449,21 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     };
 
     let currentTab = 'stdout';
+    let autoScroll = true;
+    const writeBuffers = { stdout: [], stderr: [], combined: [] };
+    let flushScheduled = false;
+
+    function flushBuffers() {
+      flushScheduled = false;
+      for (const name of Object.keys(panels)) {
+        const buf = writeBuffers[name];
+        if (buf.length > 0) {
+          writeBuffers[name] = [];
+          panels[name].terminal.write(buf.join(''));
+        }
+      }
+      if (autoScroll) panels[currentTab].terminal.scrollToBottom();
+    }
 
     function sendResize() {
       const term = panels[currentTab].terminal;
@@ -1465,6 +1480,11 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     fitActivePanel();
     window.addEventListener('resize', fitActivePanel);
     function switchTab(name) {
+      const buf = writeBuffers[name];
+      if (buf.length > 0) {
+        writeBuffers[name] = [];
+        panels[name].terminal.write(buf.join(''));
+      }
       currentTab = name;
       document.querySelectorAll('.tab').forEach(t =>
         t.classList.toggle('active', t.dataset.tab === name));
@@ -1476,17 +1496,22 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
       });
     }
 
-    let autoScroll = true;
     function toggleScroll() {
       autoScroll = !autoScroll;
       const btn = document.getElementById('scroll-btn');
       btn.textContent = autoScroll ? '\\u23f8 Pause' : '\\u25b6 Resume';
-      if (autoScroll) Object.values(panels).forEach(p => p.terminal.scrollToBottom());
+      if (autoScroll) {
+        flushBuffers();
+        Object.values(panels).forEach(p => p.terminal.scrollToBottom());
+      }
     }
 
-    function writeToTerminal(terminal, data) {
-      terminal.write(data);
-      if (autoScroll) terminal.scrollToBottom();
+    function writeToTerminal(name, data) {
+      writeBuffers[name].push(data);
+      if (name === currentTab && !flushScheduled) {
+        flushScheduled = true;
+        requestAnimationFrame(flushBuffers);
+      }
     }
 
     let processExited = false;
@@ -1538,6 +1563,7 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     });
 
     function downloadOutput() {
+      flushBuffers();
       const { terminal } = panels[currentTab];
       const buf = terminal.buffer.active;
       const lines = [];
@@ -1627,23 +1653,23 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     let stdoutLastId = -1, stderrLastId = -1, combinedLastId = -1;
 
     connectSSE(() => '/sessions/' + SESSION_ID + '/stdout' + (stdoutLastId >= 0 ? '?from=' + (stdoutLastId + 1) : ''), source => {
-      source.onmessage = e => { if (e.lastEventId) stdoutLastId = parseInt(e.lastEventId); writeToTerminal(panels.stdout.terminal, decodeBase64(e.data)); };
+      source.onmessage = e => { if (e.lastEventId) stdoutLastId = parseInt(e.lastEventId); writeToTerminal('stdout', decodeBase64(e.data)); };
     });
 
     connectSSE(() => '/sessions/' + SESSION_ID + '/stderr' + (stderrLastId >= 0 ? '?from=' + (stderrLastId + 1) : ''), source => {
-      source.onmessage = e => { if (e.lastEventId) stderrLastId = parseInt(e.lastEventId); writeToTerminal(panels.stderr.terminal, decodeBase64(e.data)); };
+      source.onmessage = e => { if (e.lastEventId) stderrLastId = parseInt(e.lastEventId); writeToTerminal('stderr', decodeBase64(e.data)); };
     });
 
     connectSSE(() => '/sessions/' + SESSION_ID + '/combined' + (combinedLastId >= 0 ? '?from=' + (combinedLastId + 1) : ''), source => {
       source.addEventListener('stdout', e => {
         if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
-        writeToTerminal(panels.combined.terminal, decodeBase64(e.data));
+        writeToTerminal('combined', decodeBase64(e.data));
       });
       source.addEventListener('stderr', e => {
         if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
-        writeToTerminal(panels.combined.terminal, '\\x1b[31m' + decodeBase64(e.data) + '\\x1b[0m');
+        writeToTerminal('combined', '\\x1b[31m' + decodeBase64(e.data) + '\\x1b[0m');
       });
-      source.onmessage = e => writeToTerminal(panels.combined.terminal, decodeBase64(e.data));
+      source.onmessage = e => writeToTerminal('combined', decodeBase64(e.data));
     });
   </script>
 </body>
