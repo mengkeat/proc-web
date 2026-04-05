@@ -464,6 +464,8 @@ class Session {
       running: !this.processExited,
       exitCode: this.exitCode,
       spawnError: this.spawnError,
+      startTime: this.startTime,
+      viewerCount: this.activeConnectionCount,
     };
   }
 
@@ -1372,6 +1374,7 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
       <button class="tab" data-tab="combined" onclick="switchTab('combined')">COMBINED</button>
     </div>
     <div class="tab-actions">
+      <button id="ts-btn" class="btn" onclick="cycleTimestamps()">⏱ Off</button>
       <button class="btn" onclick="toggleSearch()">🔍 Search</button>
       <button id="scroll-btn" class="btn" onclick="toggleScroll()">⏸ Pause</button>
       <button class="btn" onclick="downloadOutput()">⬇ Save</button>
@@ -1414,6 +1417,7 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.js"></script>
   <script>
     const SESSION_ID = '${session.id}';
+    const SESSION_START_TIME = ${session.startTime};
     const AUTH_TOKEN = ${authToken ? `'${authToken}'` : 'null'};
     const HAS_CONTROL = ${hasControl};
     function authHeaders() { return AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}; }
@@ -1452,6 +1456,51 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     let autoScroll = true;
     const writeBuffers = { stdout: [], stderr: [], combined: [] };
     let flushScheduled = false;
+    let timestampMode = 'off';
+    const atLineStart = { stdout: true, stderr: true, combined: true };
+
+    function getTimestamp() {
+      const now = Date.now();
+      if (timestampMode === 'absolute') {
+        return new Date(now).toLocaleTimeString();
+      }
+      return '+' + ((now - SESSION_START_TIME) / 1000).toFixed(1) + 's';
+    }
+
+    function injectTimestamps(name, data) {
+      if (timestampMode === 'off') return data;
+      const ts = getTimestamp();
+      const prefix = '\\x1b[90m[' + ts + ']\\x1b[0m ';
+      let result = '';
+      let i = 0;
+      while (i < data.length) {
+        if (data.charCodeAt(i) === 0x1b && i + 1 < data.length && data[i + 1] === '[') {
+          const end = data.indexOf('m', i + 2);
+          if (end !== -1) {
+            result += data.slice(i, end + 1);
+            i = end + 1;
+            continue;
+          }
+        }
+        if (atLineStart[name]) {
+          result += prefix;
+          atLineStart[name] = false;
+        }
+        result += data[i];
+        if (data[i] === '\\n') atLineStart[name] = true;
+        i++;
+      }
+      return result;
+    }
+
+    function cycleTimestamps() {
+      const modes = ['off', 'absolute', 'relative'];
+      const idx = modes.indexOf(timestampMode);
+      timestampMode = modes[(idx + 1) % modes.length];
+      const btn = document.getElementById('ts-btn');
+      const labels = { off: '⏱ Off', absolute: '⏱ Abs', relative: '⏱ Rel' };
+      btn.textContent = labels[timestampMode];
+    }
 
     function flushBuffers() {
       flushScheduled = false;
@@ -1507,6 +1556,7 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     }
 
     function writeToTerminal(name, data) {
+      data = injectTimestamps(name, data);
       writeBuffers[name].push(data);
       if (name === currentTab && !flushScheduled) {
         flushScheduled = true;
@@ -1563,20 +1613,10 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     });
 
     function downloadOutput() {
-      flushBuffers();
-      const { terminal } = panels[currentTab];
-      const buf = terminal.buffer.active;
-      const lines = [];
-      for (let i = 0; i < buf.length; i++) {
-        lines.push(buf.getLine(i)?.translateToString(true) ?? '');
-      }
-      while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-      const blob = new Blob([lines.join('\\n')], { type: 'text/plain' });
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = currentTab + '-output.txt';
+      a.href = '/sessions/' + SESSION_ID + '/export/' + currentTab;
+      a.download = currentTab + '.log';
       a.click();
-      URL.revokeObjectURL(a.href);
     }
 
     let searchVisible = false;

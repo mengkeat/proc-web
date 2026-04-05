@@ -288,12 +288,12 @@ These are quality-of-life features that improve day-to-day usage.
 **Why:** Very useful for debugging and long-running tasks.
 
 **Tasks**
-- Add absolute and relative timestamp modes
-- Decide whether timestamps are per chunk or per line
-- Keep raw export unaffected by display-only timestamps, or provide both modes
+- [x] Add absolute and relative timestamp modes
+- [x] Decide whether timestamps are per chunk or per line
+- [x] Keep raw export unaffected by display-only timestamps, or provide both modes
 
 **Done when**
-- Users can correlate output timing visually
+- [x] Users can correlate output timing visually
 
 ### 5.2 Better output filtering and navigation
 **Priority:** Medium  

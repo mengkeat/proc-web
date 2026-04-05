@@ -392,6 +392,64 @@ describe("Phase 4.1: Introduce sessions", () => {
   });
 });
 
+describe("Phase 5.1: Timestamps toggle", () => {
+  test("session HTML includes timestamp toggle button and logic", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      expect(viewRes.status).toBe(200);
+      const html = await viewRes.text();
+      expect(html).toContain("cycleTimestamps()");
+      expect(html).toContain("timestampMode");
+      expect(html).toContain("injectTimestamps");
+      expect(html).toContain("SESSION_START_TIME");
+      expect(html).toContain("ts-btn");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("status endpoint returns startTime and viewerCount", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const statusRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/status`);
+      expect(statusRes.status).toBe(200);
+      const status = await statusRes.json();
+      expect(typeof status.startTime).toBe("number");
+      expect(status.startTime).toBeGreaterThan(0);
+      expect(typeof status.viewerCount).toBe("number");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("download uses server-side export endpoint", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("/export/' + currentTab");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+});
+
 describe("Phase 5.3: Improved client rendering performance", () => {
   test("session HTML includes write batching for rendering performance", async () => {
     await startServer();
