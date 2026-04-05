@@ -1354,6 +1354,11 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     }
     .search-bar input:focus { outline: none; border-color: #4ec9b0; }
     .search-bar .search-count { font-size: 11px; color: #888; min-width: 20px; }
+    .filter-group { display: inline-flex; gap: 2px; }
+    .btn-sm { padding: 2px 8px; font-size: 11px; }
+    .btn-sm.active { background: #4ec9b0; color: #1e1e1e; border-color: #4ec9b0; }
+    .tab-count { font-size: 10px; color: #666; }
+    .tab.active .tab-count { color: #4ec9b0; }
   </style>
 </head>
 <body>
@@ -1369,15 +1374,23 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
 
   <div class="tabs-bar">
     <div class="tab-list">
-      <button class="tab active" data-tab="stdout" onclick="switchTab('stdout')">STDOUT</button>
-      <button class="tab" data-tab="stderr" onclick="switchTab('stderr')">STDERR</button>
-      <button class="tab" data-tab="combined" onclick="switchTab('combined')">COMBINED</button>
+      <button class="tab active" data-tab="stdout" onclick="switchTab('stdout')">STDOUT <span id="count-stdout" class="tab-count"></span></button>
+      <button class="tab" data-tab="stderr" onclick="switchTab('stderr')">STDERR <span id="count-stderr" class="tab-count"></span></button>
+      <button class="tab" data-tab="combined" onclick="switchTab('combined')">COMBINED <span id="count-combined" class="tab-count"></span></button>
     </div>
     <div class="tab-actions">
+      <span id="combined-filter" class="filter-group" style="display:none">
+        <button class="btn btn-sm active" data-filter="all" onclick="setCombinedFilter('all')">All</button>
+        <button class="btn btn-sm" data-filter="stdout" onclick="setCombinedFilter('stdout')">Out</button>
+        <button class="btn btn-sm" data-filter="stderr" onclick="setCombinedFilter('stderr')">Err</button>
+      </span>
       <button id="ts-btn" class="btn" onclick="cycleTimestamps()">⏱ Off</button>
+      <button id="wrap-btn" class="btn" onclick="toggleWrap()">↩ Wrap</button>
       <button class="btn" onclick="toggleSearch()">🔍 Search</button>
       <button id="scroll-btn" class="btn" onclick="toggleScroll()">⏸ Pause</button>
       <button class="btn" onclick="downloadOutput()">⬇ Save</button>
+      <button class="btn" onclick="jumpError(-1)">↑ Err</button>
+      <button class="btn" onclick="jumpError(1)">↓ Err</button>
     </div>
   </div>
 
@@ -1502,6 +1515,53 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
       btn.textContent = labels[timestampMode];
     }
 
+    let combinedFilter = 'all';
+    const chunkCounts = { stdout: 0, stderr: 0, combined: 0 };
+    const ERROR_PATTERN = /(error|exception|failed|fatal|traceback|panic)/i;
+    let wrapEnabled = true;
+
+    function setCombinedFilter(mode) {
+      combinedFilter = mode;
+      document.querySelectorAll('#combined-filter .btn-sm').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.filter === mode);
+      });
+    }
+
+    function toggleWrap() {
+      wrapEnabled = !wrapEnabled;
+      document.getElementById('wrap-btn').textContent = wrapEnabled ? '\\u21a9 Wrap' : '\\u2192 NoWrap';
+      for (const name of Object.keys(panels)) {
+        if (wrapEnabled) {
+          try { panels[name].fitAddon.fit(); } catch (_) {}
+        } else {
+          panels[name].terminal.options.cols = 9999;
+        }
+      }
+    }
+
+    function jumpError(direction) {
+      const term = panels[currentTab].terminal;
+      const buf = term.buffer.active;
+      const start = direction > 0 ? buf.cursorY + 1 : Math.max(0, buf.cursorY - 1);
+      for (let i = start; direction > 0 ? i < buf.length : i >= 0; i += direction) {
+        const line = buf.getLine(i);
+        if (line) {
+          const text = line.translateToString(true);
+          if (text && ERROR_PATTERN.test(text)) {
+            term.scrollToLine(i);
+            return;
+          }
+        }
+      }
+    }
+
+    function updateChunkCounts() {
+      for (const name of Object.keys(chunkCounts)) {
+        const el = document.getElementById('count-' + name);
+        if (el) el.textContent = chunkCounts[name] > 0 ? '(' + chunkCounts[name] + ')' : '';
+      }
+    }
+
     function flushBuffers() {
       flushScheduled = false;
       for (const name of Object.keys(panels)) {
@@ -1539,6 +1599,8 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
         t.classList.toggle('active', t.dataset.tab === name));
       document.querySelectorAll('.panel').forEach(p =>
         p.classList.toggle('active', p.id === 'panel-' + name));
+      const filterEl = document.getElementById('combined-filter');
+      if (filterEl) filterEl.style.display = name === 'combined' ? '' : 'none';
       requestAnimationFrame(() => {
         try { panels[name].fitAddon.fit(); } catch (_) {}
         if (autoScroll) panels[name].terminal.scrollToBottom();
@@ -1693,23 +1755,27 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     let stdoutLastId = -1, stderrLastId = -1, combinedLastId = -1;
 
     connectSSE(() => '/sessions/' + SESSION_ID + '/stdout' + (stdoutLastId >= 0 ? '?from=' + (stdoutLastId + 1) : ''), source => {
-      source.onmessage = e => { if (e.lastEventId) stdoutLastId = parseInt(e.lastEventId); writeToTerminal('stdout', decodeBase64(e.data)); };
+      source.onmessage = e => { if (e.lastEventId) stdoutLastId = parseInt(e.lastEventId); chunkCounts.stdout++; updateChunkCounts(); writeToTerminal('stdout', decodeBase64(e.data)); };
     });
 
     connectSSE(() => '/sessions/' + SESSION_ID + '/stderr' + (stderrLastId >= 0 ? '?from=' + (stderrLastId + 1) : ''), source => {
-      source.onmessage = e => { if (e.lastEventId) stderrLastId = parseInt(e.lastEventId); writeToTerminal('stderr', decodeBase64(e.data)); };
+      source.onmessage = e => { if (e.lastEventId) stderrLastId = parseInt(e.lastEventId); chunkCounts.stderr++; updateChunkCounts(); writeToTerminal('stderr', decodeBase64(e.data)); };
     });
 
     connectSSE(() => '/sessions/' + SESSION_ID + '/combined' + (combinedLastId >= 0 ? '?from=' + (combinedLastId + 1) : ''), source => {
       source.addEventListener('stdout', e => {
         if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
-        writeToTerminal('combined', decodeBase64(e.data));
+        chunkCounts.combined++;
+        updateChunkCounts();
+        if (combinedFilter === 'all' || combinedFilter === 'stdout') writeToTerminal('combined', decodeBase64(e.data));
       });
       source.addEventListener('stderr', e => {
         if (e.lastEventId) combinedLastId = parseInt(e.lastEventId);
-        writeToTerminal('combined', '\\x1b[31m' + decodeBase64(e.data) + '\\x1b[0m');
+        chunkCounts.combined++;
+        updateChunkCounts();
+        if (combinedFilter === 'all' || combinedFilter === 'stderr') writeToTerminal('combined', '\\x1b[31m' + decodeBase64(e.data) + '\\x1b[0m');
       });
-      source.onmessage = e => writeToTerminal('combined', decodeBase64(e.data));
+      source.onmessage = e => { chunkCounts.combined++; updateChunkCounts(); writeToTerminal('combined', decodeBase64(e.data)); };
     });
   </script>
 </body>

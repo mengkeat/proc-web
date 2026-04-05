@@ -300,14 +300,14 @@ These are quality-of-life features that improve day-to-day usage.
 **Why:** Logs become harder to navigate as sessions get larger.
 
 **Tasks**
-- Add stdout/stderr filtering in combined view
-- Add text/regex highlight filter
-- Add wrap/no-wrap toggle
-- Add jump-to-next-error / previous-error
-- Add line counts or chunk counts where useful
+- [x] Add stdout/stderr filtering in combined view
+- [x] Add text/regex highlight filter
+- [x] Add wrap/no-wrap toggle
+- [x] Add jump-to-next-error / previous-error
+- [x] Add line counts or chunk counts where useful
 
 **Done when**
-- Large outputs are easier to inspect in-browser
+- [x] Large outputs are easier to inspect in-browser
 
 ### 5.3 Improved client rendering performance
 **Priority:** Medium  

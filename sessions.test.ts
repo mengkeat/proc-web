@@ -505,3 +505,60 @@ describe("Phase 5.3: Improved client rendering performance", () => {
     }
   });
 });
+
+describe("Phase 5.2: Better output filtering and navigation", () => {
+  test("session HTML includes combined view filter buttons", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("setCombinedFilter('all')");
+      expect(html).toContain("setCombinedFilter('stdout')");
+      expect(html).toContain("setCombinedFilter('stderr')");
+      expect(html).toContain("combined-filter");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("session HTML includes wrap toggle and error jump", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("toggleWrap()");
+      expect(html).toContain("jumpError(-1)");
+      expect(html).toContain("jumpError(1)");
+      expect(html).toContain("ERROR_PATTERN");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("session HTML includes chunk count tracking", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("chunkCounts");
+      expect(html).toContain("updateChunkCounts");
+      expect(html).toContain("count-stdout");
+      expect(html).toContain("count-stderr");
+      expect(html).toContain("count-combined");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+});
