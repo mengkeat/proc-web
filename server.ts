@@ -104,6 +104,7 @@ class Session {
   combinedClients: Set<ReadableStreamDefaultController>;
   activeConnectionCount: number;
   heartbeatTimer: Timer | null;
+  bytesStreamed: number;
 
   proc: ReturnType<typeof spawn> | null;
   ptyProc: any;
@@ -140,6 +141,7 @@ class Session {
     this.combinedClients = new Set();
     this.activeConnectionCount = 0;
     this.heartbeatTimer = null;
+    this.bytesStreamed = 0;
 
     this.proc = null;
     this.ptyProc = null;
@@ -289,6 +291,7 @@ class Session {
   }
 
   private handleStdoutData(data: string) {
+    this.bytesStreamed += data.length;
     this.stdoutHistory.push(data);
     this.stdoutDropped = this.trimHistory(this.stdoutHistory, this.stdoutDropped);
     const stdoutEventId = this.stdoutDropped + this.stdoutHistory.length - 1;
@@ -302,6 +305,7 @@ class Session {
   }
 
   private handleStderrData(data: string) {
+    this.bytesStreamed += data.length;
     this.stderrHistory.push(data);
     this.stderrDropped = this.trimHistory(this.stderrHistory, this.stderrDropped);
     const stderrEventId = this.stderrDropped + this.stderrHistory.length - 1;
@@ -466,6 +470,7 @@ class Session {
       spawnError: this.spawnError,
       startTime: this.startTime,
       viewerCount: this.activeConnectionCount,
+      bytesStreamed: this.bytesStreamed,
     };
   }
 
@@ -1359,6 +1364,32 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     .btn-sm.active { background: #4ec9b0; color: #1e1e1e; border-color: #4ec9b0; }
     .tab-count { font-size: 10px; color: #666; }
     .tab.active .tab-count { color: #4ec9b0; }
+    .btn:focus-visible { outline: 2px solid #4ec9b0; outline-offset: 1px; }
+    .btn:active { transform: scale(0.97); }
+    .btn:hover { background: #4a4a4a; border-color: #666; }
+    .btn-danger:hover { background: #6a2020; border-color: #8a3a3a; }
+    #status-info { font-size: 11px; color: #888; white-space: nowrap; }
+    @media (max-width: 768px) {
+      header { padding: 6px 8px; gap: 6px; flex-wrap: wrap; }
+      .logo { font-size: 12px; }
+      .session-id { font-size: 10px; }
+      .command { font-size: 11px; }
+      .tab { padding: 6px 10px; font-size: 11px; }
+      .tab-actions { padding: 0 6px; gap: 4px; }
+      .btn { padding: 3px 6px; font-size: 11px; }
+      .stdin-area { padding: 6px 8px; flex-wrap: wrap; }
+      .stdin-area input { min-width: 120px; }
+      .search-bar { padding: 4px 8px; }
+      .search-bar input { width: 160px; }
+    }
+    @media (max-width: 480px) {
+      .tabs-bar { flex-direction: column; }
+      .tab-list { width: 100%; }
+      .tab-actions { width: 100%; justify-content: flex-start; padding: 4px 6px; overflow-x: auto; }
+      .tab { flex: 1; text-align: center; }
+      header { gap: 4px; }
+      .command { display: none; }
+    }
   </style>
 </head>
 <body>
@@ -1368,6 +1399,7 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     <span class="command" title="${commandHtml}">${commandHtml}</span>
     <div class="header-right">
       <span id="status-el" class="status-running">● Running</span>
+      <span id="status-info"></span>
       <button id="kill-btn" class="btn btn-danger" onclick="killProcess()">Kill</button>
     </div>
   </header>
@@ -1627,9 +1659,23 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
     }
 
     let processExited = false;
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / 1048576).toFixed(1) + ' MB';
+    }
+    function formatDuration(ms) {
+      const s = Math.floor(ms / 1000);
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+      return m + ':' + String(sec).padStart(2, '0');
+    }
     function updateStatus() {
       fetch('/sessions/' + SESSION_ID + '/status').then(r => r.json()).then(s => {
         const el = document.getElementById('status-el');
+        const info = document.getElementById('status-info');
         if (s.spawnError) {
           processExited = true;
           el.textContent = '\\u25cf Spawn Error';
@@ -1640,6 +1686,10 @@ function generateSessionHTML(session: Session, authToken: string | null, hasCont
         } else if (s.running) {
           el.textContent = '\\u25cf Running';
           el.className = 'status-running';
+          const runtime = formatDuration(Date.now() - s.startTime);
+          const viewers = s.viewerCount || 0;
+          const bytes = formatBytes(s.bytesStreamed || 0);
+          info.textContent = runtime + ' | ' + viewers + ' viewer' + (viewers !== 1 ? 's' : '') + ' | ' + bytes;
         } else {
           processExited = true;
           el.textContent = '\\u25cf Exited (' + s.exitCode + ')';

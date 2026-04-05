@@ -327,13 +327,13 @@ These are quality-of-life features that improve day-to-day usage.
 **Why:** Improves perceived completeness.
 
 **Tasks**
-- Add mobile/responsive improvements
-- Improve status display with runtime and bytes streamed
-- Add theme polish and better button states
-- Show viewer count / connection status
+- [x] Add mobile/responsive improvements
+- [x] Improve status display with runtime and bytes streamed
+- [x] Add theme polish and better button states
+- [x] Show viewer count / connection status
 
 **Done when**
-- The app feels more finished and easier to use
+- [x] The app feels more finished and easier to use
 
 ---
 

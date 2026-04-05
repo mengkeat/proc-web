@@ -562,3 +562,76 @@ describe("Phase 5.2: Better output filtering and navigation", () => {
     }
   });
 });
+
+describe("Phase 5.4: Visual polish and UX refinements", () => {
+  test("status endpoint returns bytesStreamed", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const statusRes = await fetch(`${SERVER_URL}/sessions/${sessionId}/status`);
+      expect(statusRes.status).toBe(200);
+      const status = await statusRes.json();
+      expect(typeof status.bytesStreamed).toBe("number");
+      expect(status.bytesStreamed).toBeGreaterThanOrEqual(0);
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("session HTML includes runtime and viewer display", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("formatDuration");
+      expect(html).toContain("formatBytes");
+      expect(html).toContain("status-info");
+      expect(html).toContain("viewer");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("session HTML includes responsive CSS media queries", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("@media (max-width: 768px)");
+      expect(html).toContain("@media (max-width: 480px)");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+
+  test("session HTML includes button focus and active states", async () => {
+    await startServer();
+    try {
+      const res = await fetch(`${SERVER_URL}/api/sessions`);
+      const sessions = await res.json();
+      const sessionId = sessions[0].id;
+
+      const viewRes = await fetch(`${SERVER_URL}/sessions/${sessionId}`);
+      const html = await viewRes.text();
+      expect(html).toContain("focus-visible");
+      expect(html).toContain(":active");
+    } finally {
+      await stopServer();
+      cleanup();
+    }
+  });
+});
